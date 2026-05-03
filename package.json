@@ -1,0 +1,85 @@
+{
+  "name": "ai-token-tracker",
+  "displayName": "AI Token Tracker",
+  "description": "Track Claude Code token usage, model, cost estimates, and rate-limit events — per project.",
+  "version": "0.1.0",
+  "publisher": "nac",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tango-christofer/ai-token-tracker.git"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "tokens",
+    "ai",
+    "usage tracker",
+    "cost"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tokenTracker.showPanel",
+        "title": "AI Token Tracker: Show Summary Panel"
+      },
+      {
+        "command": "tokenTracker.resetSession",
+        "title": "AI Token Tracker: Reset Session Counter"
+      },
+      {
+        "command": "tokenTracker.openDashboard",
+        "title": "AI Token Tracker: Open Web Dashboard"
+      }
+    ],
+    "configuration": {
+      "title": "AI Token Tracker",
+      "properties": {
+        "tokenTracker.apiPort": {
+          "type": "number",
+          "default": 7842,
+          "description": "Port for the local REST API served to the web dashboard."
+        },
+        "tokenTracker.enableServer": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start the local REST API server so the Lovable web dashboard can connect."
+        },
+        "tokenTracker.logDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Override Claude log directory (auto-detected from ~/.claude/projects/ if empty)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run bundle",
+    "bundle": "node -e \"require('fs').mkdirSync('out',{recursive:true})\" && npx esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --platform=node --target=node18 --sourcemap && node -e \"require('fs').copyFileSync('src/pricing.json','out/pricing.json')\"",
+    "compile": "tsc --noEmit",
+    "watch": "npx esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --platform=node --target=node18 --sourcemap --watch",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.0"
+  }
+}

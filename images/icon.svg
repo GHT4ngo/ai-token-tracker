@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#1a0d2e"/>
+    </linearGradient>
+    <linearGradient id="hexGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="fillGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a78bfa" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0.06"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect width="128" height="128" rx="22" fill="url(#bgGrad)"/>
+
+  <!-- Subtle grid lines (very faint) -->
+  <line x1="0" y1="64" x2="128" y2="64" stroke="#7c3aed" stroke-width="0.4" opacity="0.15"/>
+  <line x1="64" y1="0" x2="64" y2="128" stroke="#7c3aed" stroke-width="0.4" opacity="0.15"/>
+
+  <!-- Outer decorative hex ring (dashed) -->
+  <polygon points="64,8 101,28.5 101,69.5 64,90 27,69.5 27,28.5"
+    fill="none" stroke="#7c3aed" stroke-width="1" stroke-dasharray="5,4" opacity="0.25"/>
+
+  <!-- Main hexagon filled -->
+  <polygon points="64,18 96,36 96,72 64,90 32,72 32,36"
+    fill="url(#fillGrad)" stroke="url(#hexGrad)" stroke-width="2.5" filter="url(#glow)"/>
+
+  <!-- Corner nodes on hex vertices -->
+  <circle cx="64"  cy="18" r="2.5" fill="#c4b5fd" filter="url(#glow)"/>
+  <circle cx="96"  cy="36" r="2.5" fill="#c4b5fd" filter="url(#glow)"/>
+  <circle cx="96"  cy="72" r="2.5" fill="#c4b5fd" filter="url(#glow)"/>
+  <circle cx="64"  cy="90" r="2.5" fill="#c4b5fd" filter="url(#glow)"/>
+  <circle cx="32"  cy="72" r="2.5" fill="#c4b5fd" filter="url(#glow)"/>
+  <circle cx="32"  cy="36" r="2.5" fill="#c4b5fd" filter="url(#glow)"/>
+
+  <!-- Lightning bolt — the "token spark" -->
+  <!-- Upper bar: slants down-left; lower bar: narrower, below gap -->
+  <path d="M72,24 L53,24 L42,60 L58,60 L48,90 L85,52 L68,52 Z"
+    fill="url(#hexGrad)" filter="url(#softGlow)" opacity="0.95"/>
+
+  <!-- Status bar strip at bottom -->
+  <rect x="14" y="99" width="100" height="21" rx="7" fill="#1c1033" opacity="0.95"/>
+  <rect x="17" y="102" width="94" height="15" rx="5" fill="#2d1b5e" opacity="0.5"/>
+
+  <!-- ⬡ glyph in status bar -->
+  <text x="23" y="114" font-family="sans-serif" font-size="11" fill="#a78bfa" filter="url(#glow)">⬡</text>
+
+  <!-- Token stats text -->
+  <text x="36" y="114" font-family="'SF Mono','Fira Code','Courier New',monospace"
+    font-size="8.5" font-weight="600" fill="#c4b5fd" letter-spacing="0.2">12.4k · $0.18</text>
+</svg>

@@ -1,0 +1,48 @@
+{
+  "_comment": "Retail API prices in USD per million tokens — update as Anthropic changes pricing.",
+  "_updated": "2026-05",
+  "models": {
+    "claude-opus-4-7": {
+      "input": 15.00,
+      "output": 75.00,
+      "cache_write": 18.75,
+      "cache_read": 1.50
+    },
+    "claude-opus-4-5": {
+      "input": 15.00,
+      "output": 75.00,
+      "cache_write": 18.75,
+      "cache_read": 1.50
+    },
+    "claude-sonnet-4-6": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_write": 3.75,
+      "cache_read": 0.30
+    },
+    "claude-sonnet-4-5": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_write": 3.75,
+      "cache_read": 0.30
+    },
+    "claude-haiku-4-5": {
+      "input": 0.80,
+      "output": 4.00,
+      "cache_write": 1.00,
+      "cache_read": 0.08
+    },
+    "claude-haiku-4-5-20251001": {
+      "input": 0.80,
+      "output": 4.00,
+      "cache_write": 1.00,
+      "cache_read": 0.08
+    },
+    "default": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_write": 3.75,
+      "cache_read": 0.30
+    }
+  }
+}
