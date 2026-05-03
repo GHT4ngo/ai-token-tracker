@@ -33,7 +33,7 @@ function activateInner(context: vscode.ExtensionContext): void {
     logDir,
     () => {
       refreshBar();
-      refreshPanel(cfg<number>('apiPort') ?? 7842);
+      refreshPanel();
     },
     () => showRateLimitWarning()
   );
@@ -62,14 +62,14 @@ function activateInner(context: vscode.ExtensionContext): void {
   // Command: show in-editor summary panel
   context.subscriptions.push(
     vscode.commands.registerCommand('tokenTracker.showPanel', () => {
-      showPanel(context, cfg<number>('apiPort') ?? 7842);
+      showPanel(context);
     })
   );
 
-  // Command: open the Lovable web dashboard in external browser
+  // Command: open the React web dashboard in external browser
   context.subscriptions.push(
     vscode.commands.registerCommand('tokenTracker.openDashboard', () => {
-      const port = cfg<number>('apiPort') ?? 7842;
+      const port = cfg<number>('dashboardPort') ?? 8080;
       vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${port}`));
     })
   );

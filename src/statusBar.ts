@@ -23,6 +23,7 @@ export function createStatusBar(context: vscode.ExtensionContext): void {
   item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   item.command = 'tokenTracker.showPanel';
   item.tooltip = 'AI Token Tracker — click to open summary panel';
+  item.color = '#a78bfa'; // violet accent — matches the extension icon and webview theme
   context.subscriptions.push(item);
   refresh();
   item.show();
