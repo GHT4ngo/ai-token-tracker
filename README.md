@@ -141,7 +141,7 @@ Edit `src/pricing.json` to update rates — no recompile needed (it's copied int
 ## Data storage
 
 ```
-%APPDATA%\Code\User\globalStorage\TangoAI.ai-token-tracker\token_tracker.json
+%APPDATA%\Code\User\globalStorage\tango-solutions.ai-token-tracker\token_tracker.json
 ```
 
 Nothing leaves your machine.

@@ -3,7 +3,7 @@
   "displayName": "AI Token Tracker",
   "description": "Track Claude Code token usage, model, cost estimates, and rate-limit events — per project.",
   "version": "0.1.0",
-  "publisher": "TangoAI",
+  "publisher": "tango-solutions",
   "engines": {
     "vscode": "^1.85.0"
   },
