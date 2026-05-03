@@ -7,7 +7,7 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "icon": "images/icon_small.svg",
+  "icon": "images/icon_128.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/GHT4ngo/ai-token-tracker.git"
