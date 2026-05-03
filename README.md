@@ -1,7 +1,7 @@
 # AI Token Tracker
 
 <p align="center">
-  <img src="images/icon.svg" width="96" alt="AI Token Tracker"/>
+  <img src="images/icon_small.svg" width="96" alt="AI Token Tracker"/>
 </p>
 
 <p align="center">
@@ -163,7 +163,7 @@ ai-token-tracker/
 │   └── server.ts         ← optional Express REST API
 ├── frontend/             ← React + Recharts dashboard (Vite)
 ├── images/
-│   └── icon.svg          ← extension icon (convert to icon.png for Marketplace)
+│   └── icon_small.svg    ← extension icon (convert to icon.png for Marketplace)
 ├── CLAUDE.md             ← architecture notes for AI-assisted development
 ├── lovable-prompt.md     ← prompt to regenerate the frontend via Lovable.dev
 └── package.json
