@@ -1,7 +1,7 @@
 # AI Token Tracker
 
 <p align="center">
-  <img src="images/icon_small.svg" width="96" alt="AI Token Tracker"/>
+  <img src="images/icon_128.png" width="96" alt="AI Token Tracker"/>
 </p>
 
 <p align="center">
