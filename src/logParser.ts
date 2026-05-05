@@ -252,8 +252,13 @@ async function scanAllAsync(rootDir: string, onChange: () => void): Promise<void
 
 // ── directory watcher ──────────────────────────────────────────────────────
 
-const watchers: fs.FSWatcher[] = [];
+const watchers:      fs.FSWatcher[] = [];
 const pollIntervals: ReturnType<typeof setInterval>[] = [];
+const watchedDirs:   string[] = [];
+
+export function getWatchedDirs(): string[] {
+  return [...watchedDirs];
+}
 
 const WSL_POLL_MS = 30_000;
 
@@ -282,6 +287,8 @@ function startWatchingDir(
   onChange: () => void,
   onRateLimit?: () => void
 ): void {
+  watchedDirs.push(rootDir);
+
   // Always do an initial async scan regardless of path type
   scanAllAsync(rootDir, onChange).catch(err =>
     console.error('[TokenTracker] Error during initial scan:', err)
@@ -348,4 +355,5 @@ export function stopWatching(): void {
     clearInterval(id);
   }
   pollIntervals.length = 0;
+  watchedDirs.length   = 0;
 }

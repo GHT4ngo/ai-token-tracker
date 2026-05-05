@@ -1,9 +1,9 @@
 import * as vscode from 'vscode';
 import { initDb } from './db';
-import { startWatching, stopWatching } from './logParser';
+import { startWatching, stopWatching, getWatchedDirs } from './logParser';
 import { createStatusBar, refresh as refreshBar, showRateLimitWarning } from './statusBar';
 import { showPanel, refreshPanel } from './webviewPanel';
-import { startServer, stopServer } from './server';
+import { queryProjects } from './db';
 
 function cfg<T>(key: string): T {
   return vscode.workspace.getConfiguration('tokenTracker').get<T>(key) as T;
@@ -19,72 +19,73 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 function activateInner(context: vscode.ExtensionContext): void {
-  const storagePath = context.globalStorageUri.fsPath;
-  initDb(storagePath);
-
-  // Status bar
+  initDb(context.globalStorageUri.fsPath);
   createStatusBar(context);
 
-  // Determine log directory (user override or auto-detect)
-  const logDir: string = cfg('logDirectory') ?? '';
+  const onChange    = () => { refreshBar(); refreshPanel(); };
+  const onRateLimit = () => showRateLimitWarning();
 
-  // Start watching log files; refresh the status bar on every change
-  startWatching(
-    logDir,
-    () => {
-      refreshBar();
-      refreshPanel();
-    },
-    () => showRateLimitWarning()
-  );
+  startWatching(cfg<string>('logDirectory') ?? '', onChange, onRateLimit);
 
-  // Start local API server if the user has opted in
-  if (cfg<boolean>('enableServer')) {
-    startServer(cfg<number>('apiPort') ?? 7842);
+  function restartWatcher(newPath: string): void {
+    stopWatching();
+    startWatching(newPath, onChange, onRateLimit);
+    refreshBar();
+    refreshPanel();
   }
 
-  // Re-apply server setting if config changes
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration(e => {
-      if (!e.affectsConfiguration('tokenTracker')) { return; }
-
-      const enabled = cfg<boolean>('enableServer');
-      const port    = cfg<number>('apiPort') ?? 7842;
-
-      if (enabled) {
-        startServer(port);
-      } else {
-        stopServer();
-      }
-    })
-  );
-
-  // Command: show in-editor summary panel
+  // Show summary panel
   context.subscriptions.push(
     vscode.commands.registerCommand('tokenTracker.showPanel', () => {
       showPanel(context);
     })
   );
 
-  // Command: open the React web dashboard in external browser
-  context.subscriptions.push(
-    vscode.commands.registerCommand('tokenTracker.openDashboard', () => {
-      const port = cfg<number>('dashboardPort') ?? 8080;
-      vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${port}`));
-    })
-  );
-
-  // Command: reset the session counter display (just refreshes the bar)
+  // Refresh status bar
   context.subscriptions.push(
     vscode.commands.registerCommand('tokenTracker.resetSession', () => {
       refreshBar();
       vscode.window.showInformationMessage('Token Tracker: status bar refreshed.');
     })
   );
-}
 
+  // Diagnose + set log path
+  context.subscriptions.push(
+    vscode.commands.registerCommand('tokenTracker.diagnose', async () => {
+      const watched  = getWatchedDirs();
+      const sessions = queryProjects().reduce((n, p) => n + p.sessions, 0);
+      const current  = cfg<string>('logDirectory') ?? '';
+
+      const statusLine = watched.length > 0
+        ? `Watching ${watched.length} path(s) · ${sessions} sessions loaded — ${watched.join(' | ')}`
+        : '⚠ No log directory found. Paste your .claude/projects path below.';
+
+      const input = await vscode.window.showInputBox({
+        title:          'AI Token Tracker — Log Path',
+        prompt:          statusLine,
+        value:           current,
+        placeHolder:    'e.g. \\\\wsl$\\Ubuntu\\home\\username\\.claude\\projects  (leave empty to auto-detect)',
+        ignoreFocusOut:  true,
+      });
+
+      if (input === undefined) { return; }   // cancelled
+
+      const trimmed = input.trim();
+      await vscode.workspace
+        .getConfiguration('tokenTracker')
+        .update('logDirectory', trimmed, vscode.ConfigurationTarget.Global);
+
+      restartWatcher(trimmed);
+
+      vscode.window.showInformationMessage(
+        trimmed
+          ? `Token Tracker: now watching "${trimmed}". Data will update shortly.`
+          : 'Token Tracker: auto-detect enabled. Rescanning now.'
+      );
+    })
+  );
+}
 
 export function deactivate(): void {
   stopWatching();
-  stopServer();
 }
