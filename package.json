@@ -2,7 +2,7 @@
   "name": "ai-token-tracker",
   "displayName": "AI Token Tracker",
   "description": "Track Claude Code token usage, model, cost estimates, and rate-limit events — per project.",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "publisher": "tango-solutions",
   "engines": {
     "vscode": "^1.85.0"
@@ -64,6 +64,11 @@
           "type": "number",
           "default": 8080,
           "description": "Port where the web dashboard frontend is running (npm run dev in the frontend/ folder)."
+        },
+        "tokenTracker.projectMerges": {
+          "type": "object",
+          "default": {},
+          "description": "Merge project folders into one display name. Key = display name, value = array of folder names to combine. Example: { \"my-app\": [\"my-app\", \"my-app-v2\", \"my-app-backup\"] }"
         }
       }
     }
