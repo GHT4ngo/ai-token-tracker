@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { initDb } from './db';
 import { startWatching, stopWatching, getWatchedDirs } from './logParser';
@@ -7,6 +8,33 @@ import { queryProjects } from './db';
 
 function cfg<T>(key: string): T {
   return vscode.workspace.getConfiguration('tokenTracker').get<T>(key) as T;
+}
+
+/**
+ * Normalise a user-pasted WSL path to UNC form that Node.js fs can access.
+ *
+ * Windows 11 File Explorer shows WSL paths as:
+ *   wsl.localhost\Ubuntu\home\user\.claude\projects   (no leading \\)
+ *   wsl.localhost/Ubuntu/home/user/.claude/projects    (forward slashes)
+ *   \\wsl.localhost\Ubuntu\...                         (already correct)
+ *   \\wsl$\Ubuntu\...                                  (already correct)
+ *
+ * Node.js needs the \\server\share UNC form.
+ */
+function normalizeWslPath(raw: string): string {
+  let p = raw.trim();
+
+  // Already a proper UNC path — just normalise slashes
+  if (p.startsWith('\\\\')) {
+    return p.replace(/\//g, '\\');
+  }
+
+  // Starts with wsl.localhost or wsl$ (without leading \\)
+  if (/^wsl[\.$]/i.test(p)) {
+    return '\\\\' + p.replace(/\//g, '\\');
+  }
+
+  return p;
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -71,16 +99,45 @@ function activateInner(context: vscode.ExtensionContext): void {
       if (input === undefined) { return; }   // cancelled
 
       const trimmed = input.trim();
+      if (!trimmed) {
+        // Empty → auto-detect
+        await vscode.workspace
+          .getConfiguration('tokenTracker')
+          .update('logDirectory', '', vscode.ConfigurationTarget.Global);
+        restartWatcher('');
+        vscode.window.showInformationMessage('Token Tracker: auto-detect enabled. Rescanning now.');
+        return;
+      }
+
+      // Normalise Windows Explorer WSL path formats to UNC
+      const normalized = normalizeWslPath(trimmed);
+
+      // Warn the user if the path cannot be found
+      if (!fs.existsSync(normalized)) {
+        const choice = await vscode.window.showWarningMessage(
+          `Path not found: "${normalized}"\n\n` +
+          `Expected UNC format for WSL:\n  \\\\wsl$\\Ubuntu\\home\\username\\.claude\\projects\n\n` +
+          `Tip: open File Explorer → Linux → Ubuntu → home → your username → .claude → projects, ` +
+          `then copy the address bar and paste it here.`,
+          'Use Anyway',
+          'Cancel'
+        );
+        if (choice !== 'Use Anyway') { return; }
+      }
+
+      // If normalisation changed the path, let the user see what was saved
+      if (normalized !== trimmed) {
+        vscode.window.showInformationMessage(`Token Tracker: path normalised to "${normalized}"`);
+      }
+
       await vscode.workspace
         .getConfiguration('tokenTracker')
-        .update('logDirectory', trimmed, vscode.ConfigurationTarget.Global);
+        .update('logDirectory', normalized, vscode.ConfigurationTarget.Global);
 
-      restartWatcher(trimmed);
+      restartWatcher(normalized);
 
       vscode.window.showInformationMessage(
-        trimmed
-          ? `Token Tracker: now watching "${trimmed}". Data will update shortly.`
-          : 'Token Tracker: auto-detect enabled. Rescanning now.'
+        `Token Tracker: now watching "${normalized}". Data will update shortly.`
       );
     })
   );
