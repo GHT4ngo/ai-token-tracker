@@ -51,7 +51,7 @@ function startOfMonth(): string { const d = new Date(); d.setDate(d.getDate() - 
 
 // ── Project grouping ──────────────────────────────────────────────────────────
 
-interface GroupedProject { name: string; provider: string; sessions: number; input: number; output: number; cost_usd: number; }
+interface GroupedProject { id: string; name: string; provider: string; sessions: number; input: number; output: number; cost_usd: number; }
 
 function groupProjects(rows: ProjectRow[], merges: Record<string, string[]>): GroupedProject[] {
   const aliasMap: Record<string, string> = {};
@@ -63,13 +63,15 @@ function groupProjects(rows: ProjectRow[], merges: Record<string, string[]>): Gr
     if (p.input === 0 && p.output === 0) { continue; }
     const short    = shortProject(p.project);
     const canonical = aliasMap[short.toLowerCase()] ?? short;
-    if (!grouped[canonical]) { grouped[canonical] = { name: canonical, provider: p.provider, sessions: 0, input: 0, output: 0, cost_usd: 0 }; }
-    grouped[canonical].sessions += p.sessions;
-    grouped[canonical].input    += p.input;
-    grouped[canonical].output   += p.output;
-    grouped[canonical].cost_usd += p.cost_usd;
+    const provider = p.provider || 'unknown';
+    const key = `${provider}:${canonical}`;
+    if (!grouped[key]) { grouped[key] = { id: key, name: canonical, provider, sessions: 0, input: 0, output: 0, cost_usd: 0 }; }
+    grouped[key].sessions += p.sessions;
+    grouped[key].input    += p.input;
+    grouped[key].output   += p.output;
+    grouped[key].cost_usd += p.cost_usd;
   }
-  return Object.values(grouped).sort((a, b) => b.cost_usd - a.cost_usd);
+  return Object.values(grouped).sort((a, b) => a.name === b.name ? a.provider.localeCompare(b.provider) : b.cost_usd - a.cost_usd);
 }
 
 // ── SVG charts ────────────────────────────────────────────────────────────────
@@ -244,14 +246,17 @@ function buildProjectsTable(
   folders: Record<string, string[]>
 ): string {
   const hasFolders = Object.keys(folders).length > 0;
-  const projectMap  = new Map(allProjects.map(p => [p.name, p]));
+  const projectMap  = new Map(allProjects.map(p => [p.id, p]));
+  const folderProjectIds = Object.values(folders).flat();
+  const legacyFolderNames = new Set(folderProjectIds.filter(id => !id.includes(':')));
   const assignedSet = new Set(Object.values(folders).flat());
-  const unfiled     = allProjects.filter(p => !assignedSet.has(p.name));
+  const unfiled     = allProjects.filter(p => !assignedSet.has(p.id) && !legacyFolderNames.has(p.name));
 
   function projectRow(p: GroupedProject, extraClass = '', indent = false): string {
-    return `<tr class="proj-row ${extraClass}" data-project="${esc(p.name)}" draggable="true">
+    const providerLabel = p.provider === 'codex' ? 'Codex' : p.provider === 'claude' ? 'Claude Code' : p.provider;
+    return `<tr class="proj-row ${extraClass}" data-project="${esc(p.id)}" draggable="true">
       <td class="pname${indent ? ' indent' : ''}">${esc(p.name)}</td>
-      <td><span class="provider-pill">${esc(p.provider)}</span></td>
+      <td><span class="provider-pill provider-${esc(p.provider)}">${esc(providerLabel)}</span></td>
       <td class="num dim">${p.sessions}</td>
       <td class="num" style="color:var(--blue)">${fmtApprox(p.input)}</td>
       <td class="num" style="color:var(--purple)">${fmtApprox(p.output)}</td>
@@ -269,7 +274,11 @@ function buildProjectsTable(
 
   // Foldered view
   const folderRows = Object.entries(folders).map(([name, names], idx) => {
-    const projects = names.map(n => projectMap.get(n)).filter(Boolean) as GroupedProject[];
+    const projects = names.flatMap(n => {
+      const exact = projectMap.get(n);
+      if (exact) { return [exact]; }
+      return allProjects.filter(p => p.name === n);
+    });
     const totalCost = projects.reduce((s, p) => s + p.cost_usd, 0);
     const projectTrs = projects.map(p => projectRow(p, `fr${idx}`, true)).join('');
 
@@ -393,7 +402,9 @@ function buildHtml(): string {
   .range-toggle { display:flex; gap:4px; align-items:center; }
   .range-btn { background:rgba(128,128,128,0.08); border:1px solid rgba(128,128,128,0.16); color:inherit; border-radius:5px; padding:2px 7px; font-size:0.72em; cursor:pointer; }
   .range-btn.active { background:var(--blue-bg); border-color:rgba(96,165,250,0.35); color:var(--blue); }
-  .provider-pill { display:inline-block; border-radius:4px; padding:1px 6px; font-size:0.74em; background:rgba(128,128,128,0.12); opacity:0.72; }
+  .provider-pill { display:inline-block; border-radius:4px; padding:1px 6px; font-size:0.74em; background:rgba(128,128,128,0.12); opacity:0.85; }
+  .provider-claude { background:rgba(167,139,250,0.12); color:var(--purple); border:1px solid rgba(167,139,250,0.24); }
+  .provider-codex { background:rgba(96,165,250,0.12); color:var(--blue); border:1px solid rgba(96,165,250,0.24); }
 
   /* Chart cards */
   .chart-card { background:rgba(128,128,128,0.07); border:1px solid rgba(128,128,128,0.14); border-radius:10px; padding:15px 16px 8px; margin-bottom:14px; }

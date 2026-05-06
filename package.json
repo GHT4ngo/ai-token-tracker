@@ -1,8 +1,8 @@
 {
   "name": "ai-token-tracker",
   "displayName": "AI Token Tracker",
-  "description": "Track Claude Code token usage, model, cost estimates, and rate-limit events — per project.",
-  "version": "0.2.8",
+  "description": "Track Claude Code and Codex token usage, cost estimates, softcap signals, and per-project activity.",
+  "version": "0.2.9",
   "publisher": "tango-solutions",
   "engines": {
     "vscode": "^1.85.0"
@@ -18,6 +18,8 @@
   "keywords": [
     "claude",
     "claude code",
+    "codex",
+    "openai",
     "tokens",
     "ai",
     "usage tracker",
@@ -48,7 +50,7 @@
         "tokenTracker.logDirectory": {
           "type": "string",
           "default": "",
-          "description": "Path to your .claude/projects folder. Leave empty for auto-detect. Run 'AI Token Tracker: Diagnose / Set Log Path' from the command palette to set this interactively."
+          "description": "Path to your .claude/projects or .codex/sessions folder. Leave empty for auto-detect. Run 'AI Token Tracker: Diagnose / Set Log Path' from the command palette to set this interactively."
         },
         "tokenTracker.projectMerges": {
           "type": "object",
