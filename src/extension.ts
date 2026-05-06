@@ -15,6 +15,7 @@ function cfg<T>(key: string): T {
  *
  * Windows 11 File Explorer shows WSL paths as:
  *   wsl.localhost\Ubuntu\home\user\.claude\projects   (no leading \\)
+ *   wsl.localhost\Ubuntu\home\user\.codex\sessions    (no leading \\)
  *   wsl.localhost/Ubuntu/home/user/.claude/projects    (forward slashes)
  *   \\wsl.localhost\Ubuntu\...                         (already correct)
  *   \\wsl$\Ubuntu\...                                  (already correct)
@@ -86,13 +87,13 @@ function activateInner(context: vscode.ExtensionContext): void {
 
       const statusLine = watched.length > 0
         ? `Watching ${watched.length} path(s) · ${sessions} sessions loaded — ${watched.join(' | ')}`
-        : '⚠ No log directory found. Paste your .claude/projects path below.';
+        : '⚠ No log directory found. Paste your .claude/projects or .codex/sessions path below.';
 
       const input = await vscode.window.showInputBox({
         title:          'AI Token Tracker — Log Path',
         prompt:          statusLine,
         value:           current,
-        placeHolder:    'e.g. \\\\wsl$\\Ubuntu\\home\\username\\.claude\\projects  (leave empty to auto-detect)',
+        placeHolder:    'e.g. \\\\wsl$\\Ubuntu\\home\\username\\.claude\\projects or \\\\wsl$\\Ubuntu\\home\\username\\.codex\\sessions',
         ignoreFocusOut:  true,
       });
 
@@ -116,9 +117,8 @@ function activateInner(context: vscode.ExtensionContext): void {
       if (!fs.existsSync(normalized)) {
         const choice = await vscode.window.showWarningMessage(
           `Path not found: "${normalized}"\n\n` +
-          `Expected UNC format for WSL:\n  \\\\wsl$\\Ubuntu\\home\\username\\.claude\\projects\n\n` +
-          `Tip: open File Explorer → Linux → Ubuntu → home → your username → .claude → projects, ` +
-          `then copy the address bar and paste it here.`,
+          `Expected UNC format for WSL:\n  \\\\wsl$\\Ubuntu\\home\\username\\.claude\\projects\n  \\\\wsl$\\Ubuntu\\home\\username\\.codex\\sessions\n\n` +
+          `Tip: open File Explorer → Linux → Ubuntu → home → your username, then choose .claude/projects or .codex/sessions and copy the address bar.`,
           'Use Anyway',
           'Cancel'
         );

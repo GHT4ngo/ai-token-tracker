@@ -6,6 +6,7 @@ import {
   upsertSession,
   addToSession,
   insertRateLimit,
+  insertLimitSnapshot,
   getOffset,
   setOffset,
 } from './db';
@@ -34,6 +35,12 @@ interface ClaudeLogEntry {
   timestamp?: string;
   content?: string;
   duration_ms?: number;
+  payload?: any;
+}
+
+interface LogRoot {
+  dir: string;
+  provider: 'claude' | 'codex';
 }
 
 // ── directory discovery ────────────────────────────────────────────────────
@@ -56,6 +63,12 @@ function getWslDistros(): string[] {
   }
 }
 
+function pushExisting(found: string[], dir: string, label: string): void {
+  if (!fs.existsSync(dir)) { return; }
+  console.log(`[TokenTracker] Found ${label}: ${dir}`);
+  found.push(dir);
+}
+
 function findWslClaudeDirs(): string[] {
   const found: string[] = [];
   for (const distro of getWslDistros()) {
@@ -63,40 +76,71 @@ function findWslClaudeDirs(): string[] {
     try {
       const homeBase = `\\\\wsl$\\${distro}\\home`;
       for (const user of fs.readdirSync(homeBase)) {
-        const dir = `${homeBase}\\${user}\\.claude\\projects`;
-        if (fs.existsSync(dir)) {
-          console.log(`[TokenTracker] Found WSL Claude dir: ${dir}`);
-          found.push(dir);
-        }
+        pushExisting(found, `${homeBase}\\${user}\\.claude\\projects`, 'WSL Claude dir');
       }
     } catch { /* distro stopped or no /home */ }
 
     // /root
     try {
-      const rootDir = `\\\\wsl$\\${distro}\\root\\.claude\\projects`;
-      if (fs.existsSync(rootDir)) {
-        console.log(`[TokenTracker] Found WSL Claude dir (root): ${rootDir}`);
-        found.push(rootDir);
-      }
+      pushExisting(found, `\\\\wsl$\\${distro}\\root\\.claude\\projects`, 'WSL Claude dir (root)');
     } catch { /* ignore */ }
   }
   return found;
 }
 
-function findAllLogDirs(override: string): string[] {
-  if (override) return [override];
+function findWslCodexSessionDirs(): string[] {
+  const found: string[] = [];
+  for (const distro of getWslDistros()) {
+    try {
+      const homeBase = `\\\\wsl$\\${distro}\\home`;
+      for (const user of fs.readdirSync(homeBase)) {
+        pushExisting(found, `${homeBase}\\${user}\\.codex\\sessions`, 'WSL Codex sessions dir');
+        pushExisting(found, `${homeBase}\\${user}\\.Codex\\sessions`, 'WSL Codex sessions dir');
+      }
+    } catch { /* distro stopped or no /home */ }
 
+    try {
+      pushExisting(found, `\\\\wsl$\\${distro}\\root\\.codex\\sessions`, 'WSL Codex sessions dir (root)');
+      pushExisting(found, `\\\\wsl$\\${distro}\\root\\.Codex\\sessions`, 'WSL Codex sessions dir (root)');
+    } catch { /* ignore */ }
+  }
+  return found;
+}
+
+function findCodexSessionDirs(): string[] {
   const dirs: string[] = [];
+  for (const rootName of ['.codex', '.Codex']) {
+    const dir = path.join(os.homedir(), rootName, 'sessions');
+    if (fs.existsSync(dir)) { dirs.push(dir); }
+  }
+  return [...new Set(dirs.map(d => path.normalize(d)))];
+}
+
+function findAllLogDirs(override: string): LogRoot[] {
+  if (override) return [{ dir: override, provider: override.toLowerCase().includes('.codex') ? 'codex' : 'claude' }];
+
+  const dirs: LogRoot[] = [];
 
   const native = path.join(os.homedir(), '.claude', 'projects');
-  if (fs.existsSync(native)) dirs.push(native);
+  if (fs.existsSync(native)) dirs.push({ dir: native, provider: 'claude' });
+
+  for (const dir of findCodexSessionDirs()) {
+    dirs.push({ dir, provider: 'codex' });
+  }
 
   // Auto-detect WSL installs on Windows hosts
   if (os.platform() === 'win32') {
-    dirs.push(...findWslClaudeDirs());
+    dirs.push(...findWslClaudeDirs().map(dir => ({ dir, provider: 'claude' as const })));
+    dirs.push(...findWslCodexSessionDirs().map(dir => ({ dir, provider: 'codex' as const })));
   }
 
-  return dirs;
+  const seen = new Set<string>();
+  return dirs.filter(root => {
+    const key = `${root.provider}:${path.normalize(root.dir).toLowerCase()}`;
+    if (seen.has(key)) { return false; }
+    seen.add(key);
+    return true;
+  });
 }
 
 // fs.watch does not work on UNC (\\wsl$) paths — use polling for those
@@ -137,7 +181,7 @@ function processLine(line: string, sessionId: number, project: string): LineResu
 
   if (isRateLimitEntry(entry)) {
     const wait = parseWaitSeconds(entry.content ?? '');
-    insertRateLimit(timestamp, wait, project);
+    insertRateLimit(timestamp, wait, project, 'claude');
     return 'ratelimit';
   }
 
@@ -201,11 +245,105 @@ function tailFile(filePath: string): boolean /* hadRateLimit */ {
     } catch { /* ignore */ }
   }
 
-  const sessionId = upsertSession(sessionFile, startedAt, project);
+  const sessionId = upsertSession(sessionFile, startedAt, project, 'claude');
 
   let hadRateLimit = false;
   for (const line of lines) {
     if (processLine(line, sessionId, project) === 'ratelimit') {
+      hadRateLimit = true;
+    }
+  }
+  return hadRateLimit;
+}
+
+function parseUnixSeconds(value: unknown): string | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) { return undefined; }
+  return new Date(value * 1000).toISOString();
+}
+
+function processCodexLine(line: string, sessionId: number, project: string): LineResult {
+  if (!line.trim()) { return null; }
+
+  let entry: ClaudeLogEntry;
+  try {
+    entry = JSON.parse(line);
+  } catch {
+    return null;
+  }
+
+  const timestamp = entry.timestamp ?? new Date().toISOString();
+  if (entry.type !== 'event_msg' || entry.payload?.type !== 'token_count') { return null; }
+
+  const info = entry.payload.info;
+  const usage = info?.last_token_usage ?? info?.total_token_usage ?? {};
+  const inputTokens = usage.input_tokens ?? 0;
+  const outputTokens = usage.output_tokens ?? 0;
+  const cacheRead = usage.cached_input_tokens ?? 0;
+  const model = entry.payload.model ?? 'gpt-5.3-codex';
+
+  if (inputTokens > 0 || outputTokens > 0 || cacheRead > 0) {
+    const cost = computeCost(model, {
+      input: inputTokens,
+      output: outputTokens,
+      cacheWrite: 0,
+      cacheRead,
+    });
+    addToSession(sessionId, model, inputTokens, outputTokens, 0, cacheRead, cost);
+  }
+
+  const limits = entry.payload.rate_limits;
+  const primary = limits?.primary;
+  const reached = limits?.rate_limit_reached_type;
+  const used = typeof primary?.used_percent === 'number' ? primary.used_percent : undefined;
+  if (used !== undefined || reached) {
+    const resetsAt = parseUnixSeconds(primary?.resets_at);
+    const wait = resetsAt ? Math.max(0, Math.round((new Date(resetsAt).getTime() - Date.now()) / 1000)) : 0;
+    insertLimitSnapshot(timestamp, project, 'codex', resetsAt, used);
+    if (reached || (used ?? 0) >= 95) {
+      insertRateLimit(timestamp, wait, project, 'codex', resetsAt, used);
+    }
+    return reached ? 'ratelimit' : 'message';
+  }
+
+  return inputTokens > 0 || outputTokens > 0 || cacheRead > 0 ? 'message' : null;
+}
+
+function tailCodexFile(filePath: string): boolean {
+  const stats = fs.statSync(filePath);
+  const currentOffset = getOffset(filePath);
+
+  if (stats.size <= currentOffset) { return false; }
+
+  const fd = fs.openSync(filePath, 'r');
+  const length = stats.size - currentOffset;
+  const buf = Buffer.alloc(length);
+  fs.readSync(fd, buf, 0, length, currentOffset);
+  fs.closeSync(fd);
+
+  setOffset(filePath, stats.size);
+
+  const sessionFile = `codex:${path.basename(filePath, '.jsonl')}`;
+  const lines = buf.toString('utf8').split('\n');
+
+  let project = path.basename(path.dirname(filePath));
+  let startedAt = new Date(stats.birthtime).toISOString();
+  for (const line of lines) {
+    if (!line.trim()) { continue; }
+    try {
+      const e: ClaudeLogEntry = JSON.parse(line);
+      if (e.timestamp && startedAt === new Date(stats.birthtime).toISOString()) { startedAt = e.timestamp; }
+      if (e.type === 'session_meta') {
+        project = e.payload?.cwd ?? project;
+        startedAt = e.payload?.timestamp ?? e.timestamp ?? startedAt;
+        break;
+      }
+    } catch { /* ignore */ }
+  }
+
+  const sessionId = upsertSession(sessionFile, startedAt, project, 'codex');
+  let hadRateLimit = false;
+  for (const line of lines) {
+    if (processCodexLine(line, sessionId, project) === 'ratelimit') {
       hadRateLimit = true;
     }
   }
@@ -218,7 +356,39 @@ function yieldToEventLoop(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve));
 }
 
-async function scanAllAsync(rootDir: string, onChange: () => void): Promise<void> {
+function collectJsonlFiles(rootDir: string, recursive: boolean): string[] {
+  const found: string[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(rootDir, { withFileTypes: true });
+  } catch {
+    return found;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(rootDir, entry.name);
+    if (entry.isDirectory() && recursive) {
+      found.push(...collectJsonlFiles(fullPath, true));
+    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      found.push(fullPath);
+    }
+  }
+  return found;
+}
+
+async function scanAllAsync(rootDir: string, provider: LogRoot['provider'], onChange: () => void): Promise<void> {
+  if (provider === 'codex') {
+    for (const file of collectJsonlFiles(rootDir, true)) {
+      await yieldToEventLoop();
+      try {
+        tailCodexFile(file);
+      } catch (err) {
+        console.error(`[TokenTracker] Error processing Codex session ${file}:`, err);
+      }
+    }
+    onChange();
+    return;
+  }
+
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(rootDir, { withFileTypes: true });
@@ -264,6 +434,7 @@ const WSL_POLL_MS = 30_000;
 
 function watchProjectDir(
   projectPath: string,
+  provider: LogRoot['provider'],
   onChange: () => void,
   onRateLimit?: () => void
 ): void {
@@ -272,7 +443,7 @@ function watchProjectDir(
     const filePath = path.join(projectPath, filename);
     if (!fs.existsSync(filePath)) { return; }
     try {
-      const hadRateLimit = tailFile(filePath);
+      const hadRateLimit = provider === 'codex' ? tailCodexFile(filePath) : tailFile(filePath);
       onChange();
       if (hadRateLimit) { onRateLimit?.(); }
     } catch (err) {
@@ -284,13 +455,14 @@ function watchProjectDir(
 
 function startWatchingDir(
   rootDir: string,
+  provider: LogRoot['provider'],
   onChange: () => void,
   onRateLimit?: () => void
 ): void {
   watchedDirs.push(rootDir);
 
   // Always do an initial async scan regardless of path type
-  scanAllAsync(rootDir, onChange).catch(err =>
+  scanAllAsync(rootDir, provider, onChange).catch(err =>
     console.error('[TokenTracker] Error during initial scan:', err)
   );
 
@@ -298,7 +470,7 @@ function startWatchingDir(
     // fs.watch is unreliable on UNC paths (\\wsl$) — poll instead
     console.log(`[TokenTracker] WSL path detected, polling every ${WSL_POLL_MS / 1000}s: ${rootDir}`);
     const id = setInterval(() => {
-      scanAllAsync(rootDir, onChange).catch(err =>
+      scanAllAsync(rootDir, provider, onChange).catch(err =>
         console.error('[TokenTracker] WSL poll error:', err)
       );
     }, WSL_POLL_MS);
@@ -308,18 +480,28 @@ function startWatchingDir(
 
   // Native path: use fs.watch for real-time updates
   try {
+    if (provider === 'codex') {
+      const id = setInterval(() => {
+        scanAllAsync(rootDir, provider, onChange).catch(err =>
+          console.error('[TokenTracker] Codex poll error:', err)
+        );
+      }, WSL_POLL_MS);
+      pollIntervals.push(id);
+      return;
+    }
+
     const rootWatcher = fs.watch(rootDir, { recursive: false }, (event, filename) => {
       if (!filename) { return; }
       const fullPath = path.join(rootDir, filename);
       if (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory()) {
-        watchProjectDir(fullPath, onChange, onRateLimit);
+        watchProjectDir(fullPath, provider, onChange, onRateLimit);
       }
     });
     watchers.push(rootWatcher);
 
     for (const entry of fs.readdirSync(rootDir, { withFileTypes: true })) {
       if (entry.isDirectory()) {
-        watchProjectDir(path.join(rootDir, entry.name), onChange, onRateLimit);
+        watchProjectDir(path.join(rootDir, entry.name), provider, onChange, onRateLimit);
       }
     }
   } catch (err) {
@@ -335,13 +517,13 @@ export function startWatching(
   const dirs = findAllLogDirs(logDirOverride);
 
   if (dirs.length === 0) {
-    console.warn('[TokenTracker] No Claude log directories found. Install Claude Code CLI or set tokenTracker.logDirectory.');
+    console.warn('[TokenTracker] No AI log directories found. Install Claude Code/Codex or set tokenTracker.logDirectory.');
     return;
   }
 
-  for (const dir of dirs) {
-    console.log(`[TokenTracker] Watching: ${dir}`);
-    startWatchingDir(dir, onChange, onRateLimit);
+  for (const root of dirs) {
+    console.log(`[TokenTracker] Watching ${root.provider}: ${root.dir}`);
+    startWatchingDir(root.dir, root.provider, onChange, onRateLimit);
   }
 }
 

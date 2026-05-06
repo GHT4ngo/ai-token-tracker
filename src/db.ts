@@ -8,6 +8,7 @@ export interface Session {
   session_file: string;
   started_at: string;
   project: string;
+  provider: string;
   model: string;
   input_tokens: number;
   output_tokens: number;
@@ -21,11 +22,15 @@ export interface RateLimitEvent {
   timestamp: string;
   wait_seconds: number;
   project: string;
+  provider?: string;
+  resets_at?: string;
+  used_percent?: number;
 }
 
 interface Store {
   sessions: Session[];
   rateLimits: RateLimitEvent[];
+  limitSnapshots: RateLimitEvent[];
   offsets: Record<string, number>;
   nextSessionId: number;
   nextRateLimitId: number;
@@ -37,6 +42,7 @@ let storePath = '';
 let store: Store = {
   sessions: [],
   rateLimits: [],
+  limitSnapshots: [],
   offsets: {},
   nextSessionId: 1,
   nextRateLimitId: 1,
@@ -50,12 +56,22 @@ export function initDb(storagePath: string): void {
     try {
       const raw = fs.readFileSync(storePath, 'utf8');
       store = JSON.parse(raw) as Store;
+      store.sessions = store.sessions.map(s => ({ ...s, provider: s.provider ?? inferProvider(s.model, s.session_file) }));
+      store.rateLimits = store.rateLimits.map(r => ({ ...r, provider: r.provider ?? 'claude' }));
+      store.limitSnapshots = (store.limitSnapshots ?? []).map(r => ({ ...r, provider: r.provider ?? 'codex' }));
     } catch {
       // corrupted file — start fresh but keep the old as backup
       const backup = storePath + '.bak';
       fs.copyFileSync(storePath, backup);
     }
   }
+}
+
+function inferProvider(model: string, sessionFile: string): string {
+  const m = (model || '').toLowerCase();
+  const f = (sessionFile || '').toLowerCase();
+  if (m.includes('gpt') || m.includes('codex') || f.startsWith('codex:')) { return 'codex'; }
+  return 'claude';
 }
 
 function save(): void {
@@ -68,7 +84,8 @@ function save(): void {
 export function upsertSession(
   sessionFile: string,
   startedAt: string,
-  project: string
+  project: string,
+  provider = 'claude'
 ): number {
   const existing = store.sessions.find(s => s.session_file === sessionFile);
   if (existing) { return existing.id; }
@@ -78,6 +95,7 @@ export function upsertSession(
     session_file: sessionFile,
     started_at: startedAt,
     project,
+    provider,
     model: '',
     input_tokens: 0,
     output_tokens: 0,
@@ -115,14 +133,44 @@ export function addToSession(
 export function insertRateLimit(
   timestamp: string,
   waitSeconds: number,
-  project: string
+  project: string,
+  provider = 'claude',
+  resetsAt?: string,
+  usedPercent?: number
 ): void {
   store.rateLimits.push({
     id: store.nextRateLimitId++,
     timestamp,
     wait_seconds: waitSeconds,
     project,
+    provider,
+    resets_at: resetsAt,
+    used_percent: usedPercent,
   });
+  save();
+}
+
+export function insertLimitSnapshot(
+  timestamp: string,
+  project: string,
+  provider: string,
+  resetsAt?: string,
+  usedPercent?: number
+): void {
+  const last = [...store.limitSnapshots].reverse().find(r => r.provider === provider);
+  if (last && last.used_percent === usedPercent && last.resets_at === resetsAt) { return; }
+  store.limitSnapshots.push({
+    id: store.nextRateLimitId++,
+    timestamp,
+    wait_seconds: 0,
+    project,
+    provider,
+    resets_at: resetsAt,
+    used_percent: usedPercent,
+  });
+  if (store.limitSnapshots.length > 500) {
+    store.limitSnapshots = store.limitSnapshots.slice(-500);
+  }
   save();
 }
 
@@ -184,6 +232,7 @@ export interface DailyRow {
   output: number;
   cost_usd: number;
   model: string;
+  provider: string;
 }
 
 export function queryDaily(days: number): DailyRow[] {
@@ -194,12 +243,13 @@ export function queryDaily(days: number): DailyRow[] {
     if (s.started_at < cutoff) { continue; }
     const date = isoDate(s.started_at);
     if (!byDate[date]) {
-      byDate[date] = { date, input: 0, output: 0, cost_usd: 0, model: s.model };
+      byDate[date] = { date, input: 0, output: 0, cost_usd: 0, model: s.model, provider: s.provider ?? inferProvider(s.model, s.session_file) };
     }
     byDate[date].input    += s.input_tokens;
     byDate[date].output   += s.output_tokens;
     byDate[date].cost_usd += s.cost_usd;
     if (s.model) { byDate[date].model = s.model; }
+    if (s.provider) { byDate[date].provider = s.provider; }
   }
 
   return Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
@@ -207,6 +257,7 @@ export function queryDaily(days: number): DailyRow[] {
 
 export interface ProjectRow {
   project: string;
+  provider: string;
   input: number;
   output: number;
   cost_usd: number;
@@ -217,13 +268,15 @@ export function queryProjects(): ProjectRow[] {
   const byProject: Record<string, ProjectRow> = {};
 
   for (const s of store.sessions) {
-    if (!byProject[s.project]) {
-      byProject[s.project] = { project: s.project, input: 0, output: 0, cost_usd: 0, sessions: 0 };
+    const provider = s.provider ?? inferProvider(s.model, s.session_file);
+    const key = `${provider}:${s.project}`;
+    if (!byProject[key]) {
+      byProject[key] = { project: s.project, provider, input: 0, output: 0, cost_usd: 0, sessions: 0 };
     }
-    byProject[s.project].input    += s.input_tokens;
-    byProject[s.project].output   += s.output_tokens;
-    byProject[s.project].cost_usd += s.cost_usd;
-    byProject[s.project].sessions += 1;
+    byProject[key].input    += s.input_tokens;
+    byProject[key].output   += s.output_tokens;
+    byProject[key].cost_usd += s.cost_usd;
+    byProject[key].sessions += 1;
   }
 
   return Object.values(byProject).sort((a, b) => b.cost_usd - a.cost_usd);
@@ -233,6 +286,9 @@ export interface RateLimitRow {
   timestamp: string;
   wait_seconds: number;
   project: string;
+  provider: string;
+  resets_at?: string;
+  used_percent?: number;
 }
 
 export function queryRateLimits(days: number): RateLimitRow[] {
@@ -240,7 +296,14 @@ export function queryRateLimits(days: number): RateLimitRow[] {
   return store.rateLimits
     .filter(r => r.timestamp >= cutoff)
     .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
-    .map(({ timestamp, wait_seconds, project }) => ({ timestamp, wait_seconds, project }));
+    .map(({ timestamp, wait_seconds, project, provider, resets_at, used_percent }) => ({
+      timestamp,
+      wait_seconds,
+      project,
+      provider: provider ?? 'claude',
+      resets_at,
+      used_percent,
+    }));
 }
 
 export interface SessionRow {
@@ -275,6 +338,67 @@ export interface LiveTotals {
   output: number;
   cost_usd: number;
   model: string;
+}
+
+export interface ProviderRiskRow {
+  provider: string;
+  used_percent: number;
+  confidence: 'observed' | 'estimated' | 'unknown';
+  resets_at?: string;
+  status: 'fresh' | 'steady' | 'watch' | 'low' | 'capped';
+}
+
+export function queryProviderRisk(days = 30): ProviderRiskRow[] {
+  const recentLimits = queryRateLimits(days);
+  const cutoff = daysAgoIso(days);
+  const recentSnapshots = store.limitSnapshots
+    .filter(r => r.timestamp >= cutoff)
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  const providers = new Set<string>([
+    ...store.sessions.map(s => s.provider ?? inferProvider(s.model, s.session_file)),
+    ...recentLimits.map(r => r.provider),
+    ...recentSnapshots.map(r => r.provider ?? 'codex'),
+  ]);
+
+  return [...providers].sort().map(provider => {
+    const providerLimits = recentLimits.filter(r => r.provider === provider);
+    const latestObserved = recentSnapshots.find(r => (r.provider ?? 'codex') === provider && typeof r.used_percent === 'number')
+      ?? providerLimits.find(r => typeof r.used_percent === 'number');
+    if (latestObserved?.used_percent !== undefined) {
+      return riskRow(provider, latestObserved.used_percent, 'observed', latestObserved.resets_at);
+    }
+
+    const capped = providerLimits[0];
+    const sessions = store.sessions.filter(s => (s.provider ?? inferProvider(s.model, s.session_file)) === provider);
+    if (capped) {
+      return riskRow(provider, 95, 'estimated', capped.resets_at);
+    }
+
+    const recentTokens = sessions
+      .filter(s => s.started_at >= cutoff)
+      .reduce((sum, s) => sum + s.input_tokens + s.output_tokens + s.cache_write + s.cache_read, 0);
+    if (recentTokens === 0) {
+      return riskRow(provider, 0, 'unknown');
+    }
+
+    const maxRecent = Math.max(recentTokens, ...sessions.map(s => s.input_tokens + s.output_tokens + s.cache_write + s.cache_read), 1);
+    return riskRow(provider, Math.min(70, Math.round((recentTokens / maxRecent) * 35)), 'estimated');
+  });
+}
+
+function riskRow(
+  provider: string,
+  usedPercent: number,
+  confidence: ProviderRiskRow['confidence'],
+  resetsAt?: string
+): ProviderRiskRow {
+  const used_percent = Math.max(0, Math.min(100, Math.round(usedPercent)));
+  const status = used_percent >= 95 ? 'capped'
+    : used_percent >= 80 ? 'low'
+    : used_percent >= 60 ? 'watch'
+    : used_percent <= 10 ? 'fresh'
+    : 'steady';
+  return { provider, used_percent, confidence, resets_at: resetsAt, status };
 }
 
 export function queryTodayTotals(): LiveTotals {

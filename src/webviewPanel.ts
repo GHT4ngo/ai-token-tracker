@@ -7,6 +7,8 @@ import {
   queryRateLimits,
   queryDaily,
   DailyRow,
+  queryProviderRisk,
+  ProviderRiskRow,
 } from './db';
 
 let panel: vscode.WebviewPanel | undefined;
@@ -20,6 +22,12 @@ function getFolders(): Record<string, string[]> {
 async function saveFolders(f: Record<string, string[]>): Promise<void> {
   await _context?.globalState.update('projectFolders', f);
 }
+function getChartRange(): number {
+  return _context?.globalState.get<number>('chartRangeDays', 30) ?? 30;
+}
+async function saveChartRange(days: number): Promise<void> {
+  await _context?.globalState.update('chartRangeDays', days);
+}
 
 // ── Formatters ────────────────────────────────────────────────────────────────
 
@@ -29,6 +37,7 @@ function fmt(n: number): string {
   return String(n);
 }
 function fmtCost(usd: number): string { return `$${usd.toFixed(2)}`; }
+function fmtApprox(n: number): string { return n === 0 ? 'quiet' : `~${fmt(n)}`; }
 function shortProject(p: string): string { return p.split(/[/\\]/).filter(Boolean).pop() ?? p; }
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -42,7 +51,7 @@ function startOfMonth(): string { const d = new Date(); d.setDate(d.getDate() - 
 
 // ── Project grouping ──────────────────────────────────────────────────────────
 
-interface GroupedProject { name: string; sessions: number; input: number; output: number; cost_usd: number; }
+interface GroupedProject { name: string; provider: string; sessions: number; input: number; output: number; cost_usd: number; }
 
 function groupProjects(rows: ProjectRow[], merges: Record<string, string[]>): GroupedProject[] {
   const aliasMap: Record<string, string> = {};
@@ -54,7 +63,7 @@ function groupProjects(rows: ProjectRow[], merges: Record<string, string[]>): Gr
     if (p.input === 0 && p.output === 0) { continue; }
     const short    = shortProject(p.project);
     const canonical = aliasMap[short.toLowerCase()] ?? short;
-    if (!grouped[canonical]) { grouped[canonical] = { name: canonical, sessions: 0, input: 0, output: 0, cost_usd: 0 }; }
+    if (!grouped[canonical]) { grouped[canonical] = { name: canonical, provider: p.provider, sessions: 0, input: 0, output: 0, cost_usd: 0 }; }
     grouped[canonical].sessions += p.sessions;
     grouped[canonical].input    += p.input;
     grouped[canonical].output   += p.output;
@@ -71,6 +80,10 @@ function linePts(pts: [number, number][]): string {
 
 function rlMarkerSvg(x: number, yTop: number, label: string): string {
   return `<circle cx="${x.toFixed(1)}" cy="${yTop.toFixed(1)}" r="4" fill="#f87171" stroke="currentColor" stroke-width="1" stroke-opacity="0.25" opacity="0.92"><title>${label}</title></circle>`;
+}
+
+function softcapLineSvg(x1: number, x2: number, y: number): string {
+  return `<line x1="${x1.toFixed(1)}" y1="${y.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y.toFixed(1)}" stroke="#f87171" stroke-width="2" stroke-linecap="round" opacity="0.85"><title>Softcap window observed</title></line>`;
 }
 
 function buildAreaChart(data: DailyRow[], rlDates: Set<string>): string {
@@ -100,7 +113,7 @@ function buildAreaChart(data: DailyRow[], rlDates: Set<string>): string {
     const v = (maxVal * k) / 4, y = yOf(v);
     return `
       <line x1="${P.l}" y1="${y.toFixed(1)}" x2="${(P.l+iW).toFixed(1)}" y2="${y.toFixed(1)}" stroke="currentColor" stroke-opacity="0.07" stroke-dasharray="3 3"/>
-      <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">${fmt(Math.round(v))}</text>`;
+      <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">${k === 0 ? 'quiet' : `${k * 25}%`}</text>`;
   }).join('');
 
   const step = Math.max(1, Math.floor(n / 7));
@@ -112,6 +125,10 @@ function buildAreaChart(data: DailyRow[], rlDates: Set<string>): string {
   const markers = data.map((d, i) => {
     if (!rlDates.has(d.date)) { return ''; }
     return rlMarkerSvg(xOf(i), P.t - 8, `Rate limit · ${d.date.slice(5).replace('-', '/')}`);
+  }).join('');
+  const softcapLines = data.map((d, i) => {
+    if (!rlDates.has(d.date)) { return ''; }
+    return softcapLineSvg(xOf(i), xOf(Math.min(n - 1, i + 1)), P.t + 3);
   }).join('');
 
   return `<svg viewBox="0 0 ${W} ${H}" width="100%" xmlns="http://www.w3.org/2000/svg">
@@ -130,6 +147,7 @@ function buildAreaChart(data: DailyRow[], rlDates: Set<string>): string {
     <path d="${outputAreaD}" fill="url(#gOut)"/>
     <path d="M ${linePts(inputPts)}" fill="none" stroke="#60a5fa" stroke-width="1.5"/>
     <path d="M ${linePts(totalPts)}" fill="none" stroke="#a78bfa" stroke-width="1.5"/>
+    ${softcapLines}
     ${xLabels}
     ${markers}
   </svg>`;
@@ -162,7 +180,7 @@ function buildBarChart(data: DailyRow[], rlDates: Set<string>): string {
     const y = P.t + iH - (v / maxCost) * iH;
     return `
       <line x1="${P.l}" y1="${y.toFixed(1)}" x2="${(P.l+iW).toFixed(1)}" y2="${y.toFixed(1)}" stroke="currentColor" stroke-opacity="0.07" stroke-dasharray="3 3"/>
-      <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">$${v.toFixed(2)}</text>`;
+      <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">${k === 0 ? 'quiet' : `${k * 33}%`}</text>`;
   }).join('');
 
   const step = Math.max(1, Math.floor(n / 7));
@@ -177,10 +195,46 @@ function buildBarChart(data: DailyRow[], rlDates: Set<string>): string {
     const x = P.l + i * slotW + slotW / 2;
     return rlMarkerSvg(x, P.t - 8, `Rate limit · ${d.date.slice(5).replace('-', '/')}`);
   }).join('');
+  const softcapLines = data.map((d, i) => {
+    if (!rlDates.has(d.date)) { return ''; }
+    const x = P.l + i * slotW + slotW / 2;
+    return softcapLineSvg(x, Math.min(P.l + iW, x + slotW), P.t + 3);
+  }).join('');
 
   return `<svg viewBox="0 0 ${W} ${H}" width="100%" xmlns="http://www.w3.org/2000/svg">
-    ${grid}${bars}${xLabels}${markers}
+    ${grid}${bars}${softcapLines}${xLabels}${markers}
   </svg>`;
+}
+
+function buildRangeToggle(activeDays: number): string {
+  return [90, 30, 7, 3].map(days => {
+    const active = days === activeDays ? ' active' : '';
+    return `<button class="range-btn${active}" data-range="${days}">${days}d</button>`;
+  }).join('');
+}
+
+function riskCopy(r: ProviderRiskRow): string {
+  if (r.status === 'capped') { return r.resets_at ? `Likely released ${new Date(r.resets_at).toLocaleString()}` : 'Softcap likely active'; }
+  if (r.status === 'low') { return 'Keep changes small'; }
+  if (r.status === 'watch') { return 'Good moment to plan'; }
+  if (r.status === 'fresh') { return 'Fresh window'; }
+  return 'Steady';
+}
+
+function buildRiskCards(risks: ProviderRiskRow[]): string {
+  if (risks.length === 0) {
+    return '<div class="empty">No AI engine activity found yet</div>';
+  }
+  return risks.map(r => {
+    const cls = `risk-${r.status}`;
+    const label = r.provider === 'codex' ? 'Codex' : r.provider === 'claude' ? 'Claude Code' : r.provider;
+    return `<div class="risk-card ${cls}">
+      <div class="risk-top"><span>${esc(label)}</span><span class="risk-confidence">${r.confidence}</span></div>
+      <div class="risk-percent">~${r.used_percent}% used</div>
+      <div class="risk-bar"><span style="width:${Math.max(2, r.used_percent)}%"></span></div>
+      <div class="risk-note">${esc(riskCopy(r))}</div>
+    </div>`;
+  }).join('');
 }
 
 // ── Projects table (with optional folders) ────────────────────────────────────
@@ -197,9 +251,10 @@ function buildProjectsTable(
   function projectRow(p: GroupedProject, extraClass = '', indent = false): string {
     return `<tr class="proj-row ${extraClass}" data-project="${esc(p.name)}" draggable="true">
       <td class="pname${indent ? ' indent' : ''}">${esc(p.name)}</td>
+      <td><span class="provider-pill">${esc(p.provider)}</span></td>
       <td class="num dim">${p.sessions}</td>
-      <td class="num" style="color:var(--blue)">${fmt(p.input)}</td>
-      <td class="num" style="color:var(--purple)">${fmt(p.output)}</td>
+      <td class="num" style="color:var(--blue)">${fmtApprox(p.input)}</td>
+      <td class="num" style="color:var(--purple)">${fmtApprox(p.output)}</td>
       <td class="cost">${fmtCost(p.cost_usd)}</td>
     </tr>`;
   }
@@ -207,8 +262,8 @@ function buildProjectsTable(
   if (!hasFolders) {
     // Simple flat list — no folder chrome until user creates one
     const rows = allProjects.map(p => projectRow(p)).join('') ||
-      '<tr><td colspan="5" class="empty">No sessions recorded yet</td></tr>';
-    return `<thead><tr><th>Project</th><th>Sessions</th><th>Input</th><th>Output</th><th>Est. Cost</th></tr></thead>
+      '<tr><td colspan="6" class="empty">No sessions recorded yet</td></tr>';
+    return `<thead><tr><th>Project</th><th>Engine</th><th>Sessions</th><th>Input</th><th>Output</th><th>Est. Cost</th></tr></thead>
     <tbody>${rows}</tbody>`;
   }
 
@@ -220,7 +275,7 @@ function buildProjectsTable(
 
     return `
     <tr class="folder-hdr" data-drop-folder="${esc(name)}" data-folder-idx="${idx}">
-      <td colspan="5" class="fhdr-cell">
+      <td colspan="6" class="fhdr-cell">
         <span class="ftoggle" data-toggle="${idx}">▼</span>
         <span class="fname">${esc(name)}</span>
         <span class="fmeta dim">${projects.length} project${projects.length !== 1 ? 's' : ''} · ${fmtCost(totalCost)}</span>
@@ -233,15 +288,15 @@ function buildProjectsTable(
   const unfiledTrs = unfiled.map(p => projectRow(p, 'unfiled-row')).join('');
   const unfiledSection = `
     <tr class="folder-hdr unfiled-hdr" data-drop-folder="" data-folder-idx="unfiled">
-      <td colspan="5" class="fhdr-cell">
+      <td colspan="6" class="fhdr-cell">
         <span class="ftoggle" data-toggle="unfiled">▼</span>
         <span class="fname dim">Unfiled</span>
         <span class="fmeta dim">${unfiled.length} project${unfiled.length !== 1 ? 's' : ''}</span>
       </td>
     </tr>
-    ${unfiledTrs || '<tr class="unfiled-row"><td colspan="5" class="empty dim">Drop projects here to unfile them</td></tr>'}`;
+    ${unfiledTrs || '<tr class="unfiled-row"><td colspan="6" class="empty dim">Drop projects here to unfile them</td></tr>'}`;
 
-  return `<thead><tr><th>Project</th><th>Sessions</th><th>Input</th><th>Output</th><th>Est. Cost</th></tr></thead>
+  return `<thead><tr><th>Project</th><th>Engine</th><th>Sessions</th><th>Input</th><th>Output</th><th>Est. Cost</th></tr></thead>
     <tbody>${folderRows}${unfiledSection}</tbody>`;
 }
 
@@ -252,9 +307,12 @@ function buildHtml(): string {
   const week       = querySummary(startOfWeek());
   const month      = querySummary(startOfMonth());
   const live       = queryTodayTotals();
-  const daily      = queryDaily(30);
+  const chartRange = getChartRange();
+  const daily      = queryDaily(chartRange);
+  const rlRange    = queryRateLimits(chartRange);
+  const risks      = queryProviderRisk(30);
+  const rlDates    = new Set(rlRange.map(r => r.timestamp.slice(0, 10)));
   const rl30       = queryRateLimits(30);
-  const rlDates    = new Set(rl30.map(r => r.timestamp.slice(0, 10)));
   const rl7        = rl30.filter(r => new Date(r.timestamp) >= new Date(Date.now() - 7 * 864e5));
 
   const cfg        = vscode.workspace.getConfiguration('tokenTracker');
@@ -322,6 +380,20 @@ function buildHtml(): string {
   .stat-tokens { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
   .tok-label { font-size:0.67em; opacity:0.5; margin-bottom:2px; }
   .tok-val   { font-size:0.85em; font-weight:600; }
+  .risk-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin-bottom:14px; }
+  .risk-card { background:rgba(128,128,128,0.07); border:1px solid rgba(128,128,128,0.14); border-radius:8px; padding:13px 14px; }
+  .risk-top { display:flex; justify-content:space-between; gap:10px; font-size:0.78em; font-weight:700; margin-bottom:8px; }
+  .risk-confidence { opacity:0.45; font-size:0.82em; text-transform:uppercase; letter-spacing:.07em; }
+  .risk-percent { font-size:1.35em; font-weight:700; margin-bottom:9px; }
+  .risk-bar { height:7px; background:rgba(128,128,128,0.16); border-radius:999px; overflow:hidden; margin-bottom:8px; }
+  .risk-bar span { display:block; height:100%; background:var(--green); border-radius:999px; }
+  .risk-low .risk-bar span, .risk-capped .risk-bar span { background:var(--red); }
+  .risk-watch .risk-bar span { background:var(--yellow); }
+  .risk-note { font-size:0.78em; opacity:0.62; }
+  .range-toggle { display:flex; gap:4px; align-items:center; }
+  .range-btn { background:rgba(128,128,128,0.08); border:1px solid rgba(128,128,128,0.16); color:inherit; border-radius:5px; padding:2px 7px; font-size:0.72em; cursor:pointer; }
+  .range-btn.active { background:var(--blue-bg); border-color:rgba(96,165,250,0.35); color:var(--blue); }
+  .provider-pill { display:inline-block; border-radius:4px; padding:1px 6px; font-size:0.74em; background:rgba(128,128,128,0.12); opacity:0.72; }
 
   /* Chart cards */
   .chart-card { background:rgba(128,128,128,0.07); border:1px solid rgba(128,128,128,0.14); border-radius:10px; padding:15px 16px 8px; margin-bottom:14px; }
@@ -391,35 +463,40 @@ function buildHtml(): string {
     <div class="stat-label">Today</div>
     <div class="stat-cost">${fmtCost(today.cost_usd)}</div>
     <div class="stat-tokens">
-      <div><div class="tok-label">↓ Input</div><div class="tok-val" style="color:var(--blue)">${fmt(today.input)}</div></div>
-      <div><div class="tok-label">↑ Output</div><div class="tok-val" style="color:var(--purple)">${fmt(today.output)}</div></div>
+      <div><div class="tok-label">↓ Input</div><div class="tok-val" style="color:var(--blue)">${fmtApprox(today.input)}</div></div>
+      <div><div class="tok-label">↑ Output</div><div class="tok-val" style="color:var(--purple)">${fmtApprox(today.output)}</div></div>
     </div>
   </div>
   <div class="stat-card">
     <div class="stat-label">7 Days</div>
     <div class="stat-cost">${fmtCost(week.cost_usd)}</div>
     <div class="stat-tokens">
-      <div><div class="tok-label">↓ Input</div><div class="tok-val" style="color:var(--blue)">${fmt(week.input)}</div></div>
-      <div><div class="tok-label">↑ Output</div><div class="tok-val" style="color:var(--purple)">${fmt(week.output)}</div></div>
+      <div><div class="tok-label">↓ Input</div><div class="tok-val" style="color:var(--blue)">${fmtApprox(week.input)}</div></div>
+      <div><div class="tok-label">↑ Output</div><div class="tok-val" style="color:var(--purple)">${fmtApprox(week.output)}</div></div>
     </div>
   </div>
   <div class="stat-card">
     <div class="stat-label">30 Days</div>
     <div class="stat-cost">${fmtCost(month.cost_usd)}</div>
     <div class="stat-tokens">
-      <div><div class="tok-label">↓ Input</div><div class="tok-val" style="color:var(--blue)">${fmt(month.input)}</div></div>
-      <div><div class="tok-label">↑ Output</div><div class="tok-val" style="color:var(--purple)">${fmt(month.output)}</div></div>
+      <div><div class="tok-label">↓ Input</div><div class="tok-val" style="color:var(--blue)">${fmtApprox(month.input)}</div></div>
+      <div><div class="tok-label">↑ Output</div><div class="tok-val" style="color:var(--purple)">${fmtApprox(month.output)}</div></div>
     </div>
   </div>
 </div>
 
+<div class="risk-grid">
+  ${buildRiskCards(risks)}
+</div>
+
 <div class="chart-card">
   <div class="chart-head">
-    <span class="chart-title">Tokens — last 30 days</span>
+    <span class="chart-title">Activity trend — last ${chartRange} days</span>
     <div class="chart-legend">
+      <span class="range-toggle">${buildRangeToggle(chartRange)}</span>
       <span class="legend-item"><span class="legend-dot" style="background:#60a5fa"></span>Input</span>
       <span class="legend-item"><span class="legend-dot" style="background:#a78bfa"></span>Output</span>
-      ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Rate limit</span>' : ''}
+      ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Softcap</span>' : ''}
     </div>
   </div>
   ${buildAreaChart(daily, rlDates)}
@@ -427,10 +504,10 @@ function buildHtml(): string {
 
 <div class="chart-card">
   <div class="chart-head">
-    <span class="chart-title">Estimated cost — last 30 days</span>
+    <span class="chart-title">Estimated cost trend — last ${chartRange} days</span>
     <div class="chart-legend">
       <span class="legend-item"><span class="legend-dot" style="background:#34d399"></span>USD</span>
-      ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Rate limit</span>' : ''}
+      ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Softcap</span>' : ''}
     </div>
   </div>
   ${buildBarChart(daily, rlDates)}
@@ -513,6 +590,12 @@ function buildHtml(): string {
         : document.querySelectorAll('.fr' + idx);
       rows.forEach(r => r.style.display = open ? 'none' : '');
       toggle.textContent = open ? '▶' : '▼';
+      return;
+    }
+
+    const rangeBtn = e.target.closest('[data-range]');
+    if (rangeBtn) {
+      vscode.postMessage({ type: 'setRange', days: Number(rangeBtn.dataset.range) });
       return;
     }
 
@@ -605,6 +688,13 @@ export function showPanel(context: vscode.ExtensionContext): void {
         }
         break;
       }
+
+      case 'setRange': {
+        const days = [90, 30, 7, 3].includes(Number(msg.days)) ? Number(msg.days) : 30;
+        await saveChartRange(days);
+        if (panel) { panel.webview.html = buildHtml(); }
+        break;
+      }
     }
   }, null, context.subscriptions);
 
@@ -616,3 +706,6 @@ export function refreshPanel(): void {
     panel.webview.html = buildHtml();
   }
 }
+
+
+
