@@ -291,6 +291,34 @@ export interface RateLimitRow {
   used_percent?: number;
 }
 
+export interface DailyByProvider {
+  date: string;
+  claude: { input: number; output: number; cost_usd: number; };
+  codex:  { input: number; output: number; cost_usd: number; };
+}
+
+export function queryDailyByProvider(days: number): DailyByProvider[] {
+  const cutoff = daysAgoIso(days);
+  const byDate: Record<string, DailyByProvider> = {};
+  for (const s of store.sessions) {
+    if (s.started_at < cutoff) { continue; }
+    const date = isoDate(s.started_at);
+    if (!byDate[date]) {
+      byDate[date] = {
+        date,
+        claude: { input: 0, output: 0, cost_usd: 0 },
+        codex:  { input: 0, output: 0, cost_usd: 0 },
+      };
+    }
+    const provider = s.provider ?? inferProvider(s.model, s.session_file);
+    const bucket = provider === 'codex' ? byDate[date].codex : byDate[date].claude;
+    bucket.input    += s.input_tokens;
+    bucket.output   += s.output_tokens;
+    bucket.cost_usd += s.cost_usd;
+  }
+  return Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
+}
+
 export function queryRateLimits(days: number): RateLimitRow[] {
   const cutoff = daysAgoIso(days);
   return store.rateLimits

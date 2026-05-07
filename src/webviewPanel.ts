@@ -5,8 +5,8 @@ import {
   queryProjects,
   ProjectRow,
   queryRateLimits,
-  queryDaily,
-  DailyRow,
+  queryDailyByProvider,
+  DailyByProvider,
   queryProviderRisk,
   ProviderRiskRow,
 } from './db';
@@ -51,27 +51,42 @@ function startOfMonth(): string { const d = new Date(); d.setDate(d.getDate() - 
 
 // ── Project grouping ──────────────────────────────────────────────────────────
 
-interface GroupedProject { id: string; name: string; provider: string; sessions: number; input: number; output: number; cost_usd: number; }
+interface GroupedProject {
+  id: string;
+  name: string;
+  provider: string;
+  sessions: number;
+  input: number;
+  output: number;
+  cost_usd: number;
+  subrows?: GroupedProject[];
+}
 
 function groupProjects(rows: ProjectRow[], merges: Record<string, string[]>): GroupedProject[] {
   const aliasMap: Record<string, string> = {};
   for (const [canonical, aliases] of Object.entries(merges)) {
     for (const alias of aliases) { aliasMap[alias.toLowerCase()] = canonical; }
   }
-  const grouped: Record<string, GroupedProject> = {};
+  const grouped: Record<string, { g: GroupedProject; srcs: GroupedProject[] }> = {};
   for (const p of rows) {
     if (p.input === 0 && p.output === 0) { continue; }
-    const short    = shortProject(p.project);
+    const short     = shortProject(p.project);
     const canonical = aliasMap[short.toLowerCase()] ?? short;
-    const provider = p.provider || 'unknown';
-    const key = `${provider}:${canonical}`;
-    if (!grouped[key]) { grouped[key] = { id: key, name: canonical, provider, sessions: 0, input: 0, output: 0, cost_usd: 0 }; }
-    grouped[key].sessions += p.sessions;
-    grouped[key].input    += p.input;
-    grouped[key].output   += p.output;
-    grouped[key].cost_usd += p.cost_usd;
+    const provider  = p.provider || 'unknown';
+    const key       = `${provider}:${canonical}`;
+    if (!grouped[key]) {
+      grouped[key] = { g: { id: key, name: canonical, provider, sessions: 0, input: 0, output: 0, cost_usd: 0 }, srcs: [] };
+    }
+    grouped[key].g.sessions += p.sessions;
+    grouped[key].g.input    += p.input;
+    grouped[key].g.output   += p.output;
+    grouped[key].g.cost_usd += p.cost_usd;
+    grouped[key].srcs.push({ id: `${provider}:${short}`, name: short, provider, sessions: p.sessions, input: p.input, output: p.output, cost_usd: p.cost_usd });
   }
-  return Object.values(grouped).sort((a, b) => a.name === b.name ? a.provider.localeCompare(b.provider) : b.cost_usd - a.cost_usd);
+  return Object.values(grouped).map(({ g, srcs }) => {
+    if (srcs.length > 1) { g.subrows = srcs; }
+    return g;
+  }).sort((a, b) => a.name === b.name ? a.provider.localeCompare(b.provider) : b.cost_usd - a.cost_usd);
 }
 
 // ── SVG charts ────────────────────────────────────────────────────────────────
@@ -85,37 +100,39 @@ function rlMarkerSvg(x: number, yTop: number, label: string): string {
 }
 
 function softcapLineSvg(x1: number, x2: number, y: number): string {
-  return `<line x1="${x1.toFixed(1)}" y1="${y.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y.toFixed(1)}" stroke="#f87171" stroke-width="2" stroke-linecap="round" opacity="0.85"><title>Softcap window observed</title></line>`;
+  return `<line x1="${x1.toFixed(1)}" y1="${y.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y.toFixed(1)}" stroke="#f87171" stroke-width="2" stroke-linecap="round" opacity="0.85"/>`;
 }
 
-function buildAreaChart(data: DailyRow[], rlDates: Set<string>): string {
+// Area chart — Claude (blue) and Codex (cyan) as separate overlapping areas
+function buildAreaChart(data: DailyByProvider[], rlDates: Set<string>): string {
   const W = 760, H = 218;
   const P = { t: 22, r: 12, b: 26, l: 50 };
   const iW = W - P.l - P.r, iH = H - P.t - P.b;
 
   if (data.length === 0) {
     return `<svg viewBox="0 0 ${W} ${H}" width="100%">
-      <text x="${W/2}" y="${H/2}" text-anchor="middle" font-size="12" fill="currentColor" fill-opacity="0.3">No data yet — start a Claude Code session</text>
+      <text x="${W/2}" y="${H/2}" text-anchor="middle" font-size="12" fill="currentColor" fill-opacity="0.3">No data yet — start a session</text>
     </svg>`;
   }
 
-  const maxVal = Math.max(...data.map(d => d.input + d.output), 1);
   const n = data.length;
   const xOf = (i: number) => P.l + (n <= 1 ? iW / 2 : (i / (n - 1)) * iW);
-  const yOf = (v: number) => P.t + iH - (v / maxVal) * iH;
-  const base = P.t + iH;
+  const claudeTotals = data.map(d => d.claude.input + d.claude.output);
+  const codexTotals  = data.map(d => d.codex.input  + d.codex.output);
+  const maxVal = Math.max(...claudeTotals, ...codexTotals, 1);
+  const yOf   = (v: number) => P.t + iH - (v / maxVal) * iH;
+  const base  = P.t + iH;
 
-  const inputPts = data.map((d, i): [number, number] => [xOf(i), yOf(d.input)]);
-  const totalPts = data.map((d, i): [number, number] => [xOf(i), yOf(d.input + d.output)]);
-
-  const inputAreaD  = `M ${linePts(inputPts)} L ${xOf(n-1).toFixed(1)},${base.toFixed(1)} L ${xOf(0).toFixed(1)},${base.toFixed(1)} Z`;
-  const outputAreaD = `M ${linePts(totalPts)} L ${linePts([...inputPts].reverse())} Z`;
+  const claudePts  = data.map((_, i): [number, number] => [xOf(i), yOf(claudeTotals[i])]);
+  const codexPts   = data.map((_, i): [number, number] => [xOf(i), yOf(codexTotals[i])]);
+  const claudeAreaD = `M ${linePts(claudePts)} L ${xOf(n-1).toFixed(1)},${base.toFixed(1)} L ${xOf(0).toFixed(1)},${base.toFixed(1)} Z`;
+  const codexAreaD  = `M ${linePts(codexPts)}  L ${xOf(n-1).toFixed(1)},${base.toFixed(1)} L ${xOf(0).toFixed(1)},${base.toFixed(1)} Z`;
 
   const grid = Array.from({ length: 5 }, (_, k) => {
     const v = (maxVal * k) / 4, y = yOf(v);
     return `
       <line x1="${P.l}" y1="${y.toFixed(1)}" x2="${(P.l+iW).toFixed(1)}" y2="${y.toFixed(1)}" stroke="currentColor" stroke-opacity="0.07" stroke-dasharray="3 3"/>
-      <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">${k === 0 ? 'quiet' : `${k * 25}%`}</text>`;
+      <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">${k === 0 ? '0' : fmt(maxVal * k / 4)}</text>`;
   }).join('');
 
   const step = Math.max(1, Math.floor(n / 7));
@@ -124,38 +141,37 @@ function buildAreaChart(data: DailyRow[], rlDates: Set<string>): string {
     return `<text x="${xOf(i).toFixed(1)}" y="${(H-4).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="currentColor" fill-opacity="0.4">${d.date.slice(5).replace('-', '/')}</text>`;
   }).join('');
 
-  const markers = data.map((d, i) => {
-    if (!rlDates.has(d.date)) { return ''; }
-    return rlMarkerSvg(xOf(i), P.t - 8, `Rate limit · ${d.date.slice(5).replace('-', '/')}`);
-  }).join('');
   const softcapLines = data.map((d, i) => {
     if (!rlDates.has(d.date)) { return ''; }
     return softcapLineSvg(xOf(i), xOf(Math.min(n - 1, i + 1)), P.t + 3);
   }).join('');
+  const markers = data.map((d, i) => {
+    if (!rlDates.has(d.date)) { return ''; }
+    return rlMarkerSvg(xOf(i), P.t - 8, `Rate limit · ${d.date.slice(5).replace('-', '/')}`);
+  }).join('');
 
   return `<svg viewBox="0 0 ${W} ${H}" width="100%" xmlns="http://www.w3.org/2000/svg">
     <defs>
-      <linearGradient id="gIn" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.50"/>
+      <linearGradient id="gClaude" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.55"/>
         <stop offset="100%" stop-color="#60a5fa" stop-opacity="0.03"/>
       </linearGradient>
-      <linearGradient id="gOut" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#a78bfa" stop-opacity="0.50"/>
-        <stop offset="100%" stop-color="#a78bfa" stop-opacity="0.03"/>
+      <linearGradient id="gCodex" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.55"/>
+        <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.03"/>
       </linearGradient>
     </defs>
     ${grid}
-    <path d="${inputAreaD}" fill="url(#gIn)"/>
-    <path d="${outputAreaD}" fill="url(#gOut)"/>
-    <path d="M ${linePts(inputPts)}" fill="none" stroke="#60a5fa" stroke-width="1.5"/>
-    <path d="M ${linePts(totalPts)}" fill="none" stroke="#a78bfa" stroke-width="1.5"/>
-    ${softcapLines}
-    ${xLabels}
-    ${markers}
+    <path d="${claudeAreaD}" fill="url(#gClaude)"/>
+    <path d="${codexAreaD}"  fill="url(#gCodex)"/>
+    <path d="M ${linePts(claudePts)}" fill="none" stroke="#60a5fa" stroke-width="1.5"/>
+    <path d="M ${linePts(codexPts)}"  fill="none" stroke="#22d3ee" stroke-width="1.5"/>
+    ${softcapLines}${xLabels}${markers}
   </svg>`;
 }
 
-function buildBarChart(data: DailyRow[], rlDates: Set<string>): string {
+// Bar chart — Claude (green) stacked under Codex (amber) per day
+function buildBarChart(data: DailyByProvider[], rlDates: Set<string>): string {
   const W = 760, H = 178;
   const P = { t: 22, r: 12, b: 26, l: 52 };
   const iW = W - P.l - P.r, iH = H - P.t - P.b;
@@ -166,15 +182,22 @@ function buildBarChart(data: DailyRow[], rlDates: Set<string>): string {
     </svg>`;
   }
 
-  const maxCost = Math.max(...data.map(d => d.cost_usd), 0.01);
+  const maxCost = Math.max(...data.map(d => d.claude.cost_usd + d.codex.cost_usd), 0.01);
   const n = data.length;
   const slotW = iW / n, barW = Math.max(2, slotW * 0.65);
 
   const bars = data.map((d, i) => {
-    const barH = Math.max(0.5, (d.cost_usd / maxCost) * iH);
-    const x = P.l + i * slotW + (slotW - barW) / 2;
-    const y = P.t + iH - barH;
-    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" rx="3" fill="#34d399" opacity="0.75"/>`;
+    const x     = P.l + i * slotW + (slotW - barW) / 2;
+    const total = d.claude.cost_usd + d.codex.cost_usd;
+    if (total === 0) { return ''; }
+    const totalH  = Math.max(1, (total / maxCost) * iH);
+    const claudeH = totalH * (d.claude.cost_usd / total);
+    const codexH  = totalH - claudeH;
+    const yBottom = P.t + iH;
+    return [
+      claudeH > 0.3 ? `<rect x="${x.toFixed(1)}" y="${(yBottom - claudeH).toFixed(1)}" width="${barW.toFixed(1)}" height="${claudeH.toFixed(1)}" rx="2" fill="#34d399" opacity="0.80"><title>Claude $${d.claude.cost_usd.toFixed(4)}</title></rect>` : '',
+      codexH  > 0.3 ? `<rect x="${x.toFixed(1)}" y="${(yBottom - claudeH - codexH).toFixed(1)}" width="${barW.toFixed(1)}" height="${codexH.toFixed(1)}"  rx="2" fill="#fbbf24" opacity="0.80"><title>Codex $${d.codex.cost_usd.toFixed(4)}</title></rect>` : '',
+    ].join('');
   }).join('');
 
   const grid = Array.from({ length: 4 }, (_, k) => {
@@ -182,7 +205,7 @@ function buildBarChart(data: DailyRow[], rlDates: Set<string>): string {
     const y = P.t + iH - (v / maxCost) * iH;
     return `
       <line x1="${P.l}" y1="${y.toFixed(1)}" x2="${(P.l+iW).toFixed(1)}" y2="${y.toFixed(1)}" stroke="currentColor" stroke-opacity="0.07" stroke-dasharray="3 3"/>
-      <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">${k === 0 ? 'quiet' : `${k * 33}%`}</text>`;
+      <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">${k === 0 ? '$0' : `$${v.toFixed(2)}`}</text>`;
   }).join('');
 
   const step = Math.max(1, Math.floor(n / 7));
@@ -192,15 +215,15 @@ function buildBarChart(data: DailyRow[], rlDates: Set<string>): string {
     return `<text x="${x.toFixed(1)}" y="${(H-4).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="currentColor" fill-opacity="0.4">${d.date.slice(5).replace('-', '/')}</text>`;
   }).join('');
 
-  const markers = data.map((d, i) => {
-    if (!rlDates.has(d.date)) { return ''; }
-    const x = P.l + i * slotW + slotW / 2;
-    return rlMarkerSvg(x, P.t - 8, `Rate limit · ${d.date.slice(5).replace('-', '/')}`);
-  }).join('');
   const softcapLines = data.map((d, i) => {
     if (!rlDates.has(d.date)) { return ''; }
     const x = P.l + i * slotW + slotW / 2;
     return softcapLineSvg(x, Math.min(P.l + iW, x + slotW), P.t + 3);
+  }).join('');
+  const markers = data.map((d, i) => {
+    if (!rlDates.has(d.date)) { return ''; }
+    const x = P.l + i * slotW + slotW / 2;
+    return rlMarkerSvg(x, P.t - 8, `Rate limit · ${d.date.slice(5).replace('-', '/')}`);
   }).join('');
 
   return `<svg viewBox="0 0 ${W} ${H}" width="100%" xmlns="http://www.w3.org/2000/svg">
@@ -217,9 +240,9 @@ function buildRangeToggle(activeDays: number): string {
 
 function riskCopy(r: ProviderRiskRow): string {
   if (r.status === 'capped') { return r.resets_at ? `Likely released ${new Date(r.resets_at).toLocaleString()}` : 'Softcap likely active'; }
-  if (r.status === 'low') { return 'Keep changes small'; }
-  if (r.status === 'watch') { return 'Good moment to plan'; }
-  if (r.status === 'fresh') { return 'Fresh window'; }
+  if (r.status === 'low')    { return 'Keep changes small'; }
+  if (r.status === 'watch')  { return 'Good moment to plan'; }
+  if (r.status === 'fresh')  { return 'Fresh window'; }
   return 'Steady';
 }
 
@@ -228,7 +251,7 @@ function buildRiskCards(risks: ProviderRiskRow[]): string {
     return '<div class="empty">No AI engine activity found yet</div>';
   }
   return risks.map(r => {
-    const cls = `risk-${r.status}`;
+    const cls   = `risk-${r.status}`;
     const label = r.provider === 'codex' ? 'Codex' : r.provider === 'claude' ? 'Claude Code' : r.provider;
     return `<div class="risk-card ${cls}">
       <div class="risk-top"><span>${esc(label)}</span><span class="risk-confidence">${r.confidence}</span></div>
@@ -239,47 +262,67 @@ function buildRiskCards(risks: ProviderRiskRow[]): string {
   }).join('');
 }
 
-// ── Projects table (with optional folders) ────────────────────────────────────
+// ── Projects table (folders + expandable merged groups) ───────────────────────
 
 function buildProjectsTable(
   allProjects: GroupedProject[],
   folders: Record<string, string[]>
 ): string {
-  const hasFolders = Object.keys(folders).length > 0;
-  const projectMap  = new Map(allProjects.map(p => [p.id, p]));
+  let sgIdx = 0;
+
+  const hasFolders      = Object.keys(folders).length > 0;
+  const projectMap      = new Map(allProjects.map(p => [p.id, p]));
   const folderProjectIds = Object.values(folders).flat();
-  const legacyFolderNames = new Set(folderProjectIds.filter(id => !id.includes(':')));
-  const assignedSet = new Set(Object.values(folders).flat());
-  const unfiled     = allProjects.filter(p => !assignedSet.has(p.id) && !legacyFolderNames.has(p.name));
+  const legacyNames     = new Set(folderProjectIds.filter(id => !id.includes(':')));
+  const assignedSet     = new Set(folderProjectIds);
+  const unfiled         = allProjects.filter(p => !assignedSet.has(p.id) && !legacyNames.has(p.name));
 
   function projectRow(p: GroupedProject, extraClass = '', indent = false): string {
     const providerLabel = p.provider === 'codex' ? 'Codex' : p.provider === 'claude' ? 'Claude Code' : p.provider;
-    return `<tr class="proj-row ${extraClass}" data-project="${esc(p.id)}" draggable="true">
-      <td class="pname${indent ? ' indent' : ''}">${esc(p.name)}</td>
+    const hasSubrows    = !!(p.subrows?.length);
+    const myIdx         = hasSubrows ? sgIdx++ : -1;
+    const toggle        = hasSubrows ? `<span class="sub-toggle" data-sub-toggle="sg${myIdx}">▼</span> ` : '';
+
+    const parentTr = `<tr class="proj-row ${extraClass}" data-project="${esc(p.id)}" draggable="true">
+      <td class="pname${indent ? ' indent' : ''}">${toggle}${esc(p.name)}</td>
       <td><span class="provider-pill provider-${esc(p.provider)}">${esc(providerLabel)}</span></td>
       <td class="num dim">${p.sessions}</td>
       <td class="num" style="color:var(--blue)">${fmtApprox(p.input)}</td>
       <td class="num" style="color:var(--purple)">${fmtApprox(p.output)}</td>
       <td class="cost">${fmtCost(p.cost_usd)}</td>
     </tr>`;
+
+    if (!hasSubrows) { return parentTr; }
+
+    const subTrs = p.subrows!.map(sub => {
+      const subLabel = sub.provider === 'codex' ? 'Codex' : sub.provider === 'claude' ? 'Claude Code' : sub.provider;
+      return `<tr class="sub-row sg${myIdx}" style="display:none">
+        <td class="pname indent2">${esc(sub.name)}</td>
+        <td><span class="provider-pill provider-${esc(sub.provider)}">${esc(subLabel)}</span></td>
+        <td class="num dim">${sub.sessions}</td>
+        <td class="num" style="color:var(--blue)">${fmtApprox(sub.input)}</td>
+        <td class="num" style="color:var(--purple)">${fmtApprox(sub.output)}</td>
+        <td class="cost">${fmtCost(sub.cost_usd)}</td>
+      </tr>`;
+    }).join('');
+
+    return parentTr + subTrs;
   }
 
   if (!hasFolders) {
-    // Simple flat list — no folder chrome until user creates one
     const rows = allProjects.map(p => projectRow(p)).join('') ||
       '<tr><td colspan="6" class="empty">No sessions recorded yet</td></tr>';
     return `<thead><tr><th>Project</th><th>Engine</th><th>Sessions</th><th>Input</th><th>Output</th><th>Est. Cost</th></tr></thead>
     <tbody>${rows}</tbody>`;
   }
 
-  // Foldered view
-  const folderRows = Object.entries(folders).map(([name, names], idx) => {
-    const projects = names.flatMap(n => {
+  const folderRows = Object.entries(folders).map(([name, ids], idx) => {
+    const projects = ids.flatMap(n => {
       const exact = projectMap.get(n);
       if (exact) { return [exact]; }
       return allProjects.filter(p => p.name === n);
     });
-    const totalCost = projects.reduce((s, p) => s + p.cost_usd, 0);
+    const totalCost  = projects.reduce((s, p) => s + p.cost_usd, 0);
     const projectTrs = projects.map(p => projectRow(p, `fr${idx}`, true)).join('');
 
     return `
@@ -317,7 +360,7 @@ function buildHtml(): string {
   const month      = querySummary(startOfMonth());
   const live       = queryTodayTotals();
   const chartRange = getChartRange();
-  const daily      = queryDaily(chartRange);
+  const daily      = queryDailyByProvider(chartRange);
   const rlRange    = queryRateLimits(chartRange);
   const risks      = queryProviderRisk(30);
   const rlDates    = new Set(rlRange.map(r => r.timestamp.slice(0, 10)));
@@ -328,6 +371,9 @@ function buildHtml(): string {
   const merges     = cfg.get<Record<string, string[]>>('projectMerges', {});
   const folders    = getFolders();
   const allProjects = groupProjects(queryProjects(), merges);
+
+  const hasCodex  = daily.some(d => d.codex.input + d.codex.output + d.codex.cost_usd > 0);
+  const hasRl     = rlDates.size > 0;
 
   const rateLimitRows = rl7.length
     ? rl7.map(r => `
@@ -342,8 +388,6 @@ function buildHtml(): string {
   const chipCls    = live.model.includes('opus')  ? 'chip-opus'
                    : live.model.includes('haiku') ? 'chip-haiku'
                    : 'chip-sonnet';
-
-  const hasRl = rlDates.size > 0;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -361,6 +405,7 @@ function buildHtml(): string {
     --yellow:   #fbbf24;
     --orange:   #fb923c;
     --red:      #f87171;
+    --cyan:     #22d3ee;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -389,6 +434,8 @@ function buildHtml(): string {
   .stat-tokens { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
   .tok-label { font-size:0.67em; opacity:0.5; margin-bottom:2px; }
   .tok-val   { font-size:0.85em; font-weight:600; }
+
+  /* Risk cards */
   .risk-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin-bottom:14px; }
   .risk-card { background:rgba(128,128,128,0.07); border:1px solid rgba(128,128,128,0.14); border-radius:8px; padding:13px 14px; }
   .risk-top { display:flex; justify-content:space-between; gap:10px; font-size:0.78em; font-weight:700; margin-bottom:8px; }
@@ -399,18 +446,20 @@ function buildHtml(): string {
   .risk-low .risk-bar span, .risk-capped .risk-bar span { background:var(--red); }
   .risk-watch .risk-bar span { background:var(--yellow); }
   .risk-note { font-size:0.78em; opacity:0.62; }
+
+  /* Controls */
   .range-toggle { display:flex; gap:4px; align-items:center; }
   .range-btn { background:rgba(128,128,128,0.08); border:1px solid rgba(128,128,128,0.16); color:inherit; border-radius:5px; padding:2px 7px; font-size:0.72em; cursor:pointer; }
   .range-btn.active { background:var(--blue-bg); border-color:rgba(96,165,250,0.35); color:var(--blue); }
   .provider-pill { display:inline-block; border-radius:4px; padding:1px 6px; font-size:0.74em; background:rgba(128,128,128,0.12); opacity:0.85; }
   .provider-claude { background:rgba(167,139,250,0.12); color:var(--purple); border:1px solid rgba(167,139,250,0.24); }
-  .provider-codex { background:rgba(96,165,250,0.12); color:var(--blue); border:1px solid rgba(96,165,250,0.24); }
+  .provider-codex  { background:rgba(34,211,238,0.12);  color:var(--cyan);   border:1px solid rgba(34,211,238,0.24); }
 
   /* Chart cards */
   .chart-card { background:rgba(128,128,128,0.07); border:1px solid rgba(128,128,128,0.14); border-radius:10px; padding:15px 16px 8px; margin-bottom:14px; }
-  .chart-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+  .chart-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; flex-wrap:wrap; gap:6px; }
   .chart-title  { font-size:0.87em; font-weight:600; }
-  .chart-legend { display:flex; gap:14px; align-items:center; }
+  .chart-legend { display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
   .legend-item  { display:flex; align-items:center; gap:5px; font-size:0.73em; opacity:0.6; }
   .legend-dot   { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
 
@@ -433,24 +482,22 @@ function buildHtml(): string {
   .fmeta { font-size:0.74em; margin-left:auto; }
   .fdel { background:none; border:none; color:inherit; opacity:0.3; cursor:pointer; font-size:0.95em; padding:0 2px; line-height:1; }
   .fdel:hover { opacity:0.75; }
-  .indent { padding-left:30px !important; }
+  .indent  { padding-left:30px !important; }
+  .indent2 { padding-left:44px !important; }
   .proj-row[draggable="true"] { cursor:grab; }
   .proj-row[draggable="true"]:active { cursor:grabbing; }
   .proj-row.dragging { opacity:0.4; }
+
+  /* Subrow expand/collapse */
+  .sub-toggle { cursor:pointer; font-size:0.72em; opacity:0.55; margin-right:3px; user-select:none; }
+  .sub-row > td { opacity:0.75; }
 
   /* New folder button */
   .new-folder-btn { background:rgba(128,128,128,0.08); border:1px solid rgba(128,128,128,0.16); color:inherit; border-radius:6px; padding:3px 10px; font-size:0.73em; cursor:pointer; white-space:nowrap; }
   .new-folder-btn:hover { background:rgba(128,128,128,0.16); }
 
-  /* Badges */
-  .badge { display:inline-block; border-radius:4px; padding:1px 6px; font-size:0.76em; font-weight:600; }
-  .badge-opus   { background:rgba(251,146,60,0.12); color:var(--orange); border:1px solid rgba(251,146,60,0.25); }
-  .badge-sonnet { background:var(--purp-bg); color:var(--purple); border:1px solid rgba(167,139,250,0.25); }
-  .badge-haiku  { background:var(--green-bg); color:var(--green);  border:1px solid rgba(52,211,153,0.25); }
-  .badge-other  { background:rgba(128,128,128,0.12); opacity:0.6; }
-
   /* Misc */
-  .pname { max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pname { max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .num  { font-variant-numeric:tabular-nums; }
   .cost { color:var(--yellow); font-weight:600; font-variant-numeric:tabular-nums; }
   .warn { color:var(--red); font-weight:600; }
@@ -502,11 +549,11 @@ function buildHtml(): string {
 
 <div class="chart-card">
   <div class="chart-head">
-    <span class="chart-title">Activity trend — last ${chartRange} days</span>
+    <span class="chart-title">Activity trend — tokens per day (last ${chartRange} days)</span>
     <div class="chart-legend">
       <span class="range-toggle">${buildRangeToggle(chartRange)}</span>
-      <span class="legend-item"><span class="legend-dot" style="background:#60a5fa"></span>Input</span>
-      <span class="legend-item"><span class="legend-dot" style="background:#a78bfa"></span>Output</span>
+      <span class="legend-item"><span class="legend-dot" style="background:#60a5fa"></span>Claude Code</span>
+      ${hasCodex ? '<span class="legend-item"><span class="legend-dot" style="background:#22d3ee"></span>Codex</span>' : ''}
       ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Softcap</span>' : ''}
     </div>
   </div>
@@ -517,7 +564,8 @@ function buildHtml(): string {
   <div class="chart-head">
     <span class="chart-title">Estimated cost trend — last ${chartRange} days</span>
     <div class="chart-legend">
-      <span class="legend-item"><span class="legend-dot" style="background:#34d399"></span>USD</span>
+      <span class="legend-item"><span class="legend-dot" style="background:#34d399"></span>Claude cost</span>
+      ${hasCodex ? '<span class="legend-item"><span class="legend-dot" style="background:#fbbf24"></span>Codex cost</span>' : ''}
       ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Softcap</span>' : ''}
     </div>
   </div>
@@ -542,6 +590,7 @@ function buildHtml(): string {
 
 <div class="footer">
   Costs are retail API equivalents — informational only.<br>
+  Claude Code and Codex both use BPE tokenizers — token counts are directly comparable on the same scale.<br>
   All data stored locally. Nothing sent to any server.
 </div>
 
@@ -567,17 +616,12 @@ function buildHtml(): string {
 
   document.addEventListener('dragover', e => {
     const zone = e.target.closest('.folder-hdr[data-drop-folder]');
-    if (zone && dragging) {
-      e.preventDefault();
-      zone.classList.add('drop-over');
-    }
+    if (zone && dragging) { e.preventDefault(); zone.classList.add('drop-over'); }
   });
 
   document.addEventListener('dragleave', e => {
     const zone = e.target.closest('.folder-hdr');
-    if (zone && !zone.contains(e.relatedTarget)) {
-      zone.classList.remove('drop-over');
-    }
+    if (zone && !zone.contains(e.relatedTarget)) { zone.classList.remove('drop-over'); }
   });
 
   document.addEventListener('drop', e => {
@@ -590,8 +634,10 @@ function buildHtml(): string {
     }
   });
 
-  // ── Collapse / expand ────────────────────────────────────────────────────
+  // ── Click delegation ─────────────────────────────────────────────────────
   document.addEventListener('click', e => {
+
+    // Folder collapse/expand
     const toggle = e.target.closest('[data-toggle]');
     if (toggle) {
       const idx  = toggle.dataset.toggle;
@@ -604,6 +650,17 @@ function buildHtml(): string {
       return;
     }
 
+    // Merged-project subrow expand/collapse
+    const subTgl = e.target.closest('[data-sub-toggle]');
+    if (subTgl) {
+      const key  = subTgl.dataset.subToggle;
+      const open = subTgl.textContent.trim() === '▼';
+      document.querySelectorAll('.' + key).forEach(r => r.style.display = open ? 'none' : '');
+      subTgl.textContent = open ? '▶' : '▼';
+      return;
+    }
+
+    // Range toggle
     const rangeBtn = e.target.closest('[data-range]');
     if (rangeBtn) {
       vscode.postMessage({ type: 'setRange', days: Number(rangeBtn.dataset.range) });
@@ -646,10 +703,7 @@ export function showPanel(context: vscode.ExtensionContext): void {
     'tokenTracker',
     'Token Tracker',
     vscode.ViewColumn.Two,
-    {
-      enableScripts: true,
-      retainContextWhenHidden: false,
-    }
+    { enableScripts: true, retainContextWhenHidden: false }
   );
 
   panel.webview.html = buildHtml();
@@ -674,11 +728,9 @@ export function showPanel(context: vscode.ExtensionContext): void {
       }
 
       case 'moveProject': {
-        // Remove from all folders first
         for (const key of Object.keys(folders)) {
           folders[key] = folders[key].filter((p: string) => p !== msg.project);
         }
-        // Add to target (empty string = unfiled = don't add anywhere)
         if (msg.folder) {
           folders[msg.folder] = [...(folders[msg.folder] ?? []), msg.project];
         }
@@ -717,6 +769,3 @@ export function refreshPanel(): void {
     panel.webview.html = buildHtml();
   }
 }
-
-
-
