@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import {
   upsertSession,
   addToSession,
@@ -41,6 +41,35 @@ interface ClaudeLogEntry {
 interface LogRoot {
   dir: string;
   provider: 'claude' | 'codex';
+  wslDistro?: string;   // set when using wsl.exe exec instead of Node.js fs
+  linuxBase?: string;   // Linux path inside WSL: /home/user/.claude/projects
+}
+
+// ── wsl.exe subprocess helpers ─────────────────────────────────────────────
+// Used when Node.js fs cannot access \\wsl$\ UNC paths (common in extension host).
+// wsl.exe is a built-in Windows binary — no extra software required.
+
+function wslExec(distro: string, shellCmd: string): Buffer {
+  return execFileSync('wsl.exe', ['-d', distro, '--', 'sh', '-c', shellCmd], {
+    timeout: 15_000,
+    maxBuffer: 50 * 1024 * 1024,
+  });
+}
+
+interface WslFile { linuxPath: string; size: number; }
+
+function wslListJsonl(distro: string, linuxDir: string, maxDepth: number): WslFile[] {
+  try {
+    const cmd = `find "${linuxDir}" -maxdepth ${maxDepth} -name '*.jsonl' -printf '%p\\t%s\\n' 2>/dev/null`;
+    const out = wslExec(distro, cmd).toString('utf8');
+    return out.trim().split('\n').filter(Boolean).flatMap(line => {
+      const tab = line.lastIndexOf('\t');
+      if (tab < 0) { return []; }
+      return [{ linuxPath: line.slice(0, tab), size: parseInt(line.slice(tab + 1), 10) || 0 }];
+    });
+  } catch {
+    return [];
+  }
 }
 
 // ── directory discovery ────────────────────────────────────────────────────
@@ -103,11 +132,16 @@ export function findWslClaudeDirs(): string[] {
     const home = tryReadHome(distro);
     if (home) {
       for (const user of home.users) {
-        // Always store as \\wsl$\ for better Node.js fs compat
         pushExisting(found, `\\\\wsl$\\${distro}\\home\\${user}\\.claude\\projects`, 'WSL Claude dir');
       }
     }
     pushExisting(found, `\\\\wsl$\\${distro}\\root\\.claude\\projects`, 'WSL Claude dir (root)');
+  }
+  // Fallback: UNC inaccessible — try wsl.exe exec to find dirs
+  if (found.length === 0) {
+    for (const root of findWslRootsViaExec()) {
+      if (root.provider === 'claude') { found.push(root.dir); }
+    }
   }
   return found;
 }
@@ -125,7 +159,55 @@ export function findWslCodexSessionDirs(): string[] {
     pushExisting(found, `\\\\wsl$\\${distro}\\root\\.codex\\sessions`, 'WSL Codex dir (root)');
     pushExisting(found, `\\\\wsl$\\${distro}\\root\\.Codex\\sessions`, 'WSL Codex dir (root)');
   }
+  // Fallback: UNC inaccessible — try wsl.exe exec to find dirs
+  if (found.length === 0) {
+    for (const root of findWslRootsViaExec()) {
+      if (root.provider === 'codex') { found.push(root.dir); }
+    }
+  }
   return found;
+}
+
+// Discover WSL log dirs via wsl.exe exec for distros where UNC paths are inaccessible.
+function findWslRootsViaExec(): LogRoot[] {
+  const result: LogRoot[] = [];
+  let distros: string[];
+  try {
+    const raw = execSync('wsl.exe -l --quiet', { timeout: 5000 });
+    distros = raw.toString('utf16le').replace(/\0/g, '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  } catch {
+    return result;
+  }
+
+  for (const distro of distros) {
+    try {
+      const script = `for u in $(ls /home 2>/dev/null); do
+  [ -d "/home/$u/.claude/projects" ] && echo "claude:/home/$u/.claude/projects"
+  [ -d "/home/$u/.codex/sessions"  ] && echo "codex:/home/$u/.codex/sessions"
+  [ -d "/home/$u/.Codex/sessions"  ] && echo "codex:/home/$u/.Codex/sessions"
+done
+[ -d "/root/.claude/projects" ] && echo "claude:/root/.claude/projects"
+[ -d "/root/.codex/sessions"  ] && echo "codex:/root/.codex/sessions"
+[ -d "/root/.Codex/sessions"  ] && echo "codex:/root/.Codex/sessions"`;
+
+      const out = execFileSync('wsl.exe', ['-d', distro, '--', 'sh', '-c', script], {
+        timeout: 10_000, maxBuffer: 64 * 1024,
+      }).toString('utf8');
+
+      for (const line of out.split('\n').map(l => l.trim()).filter(Boolean)) {
+        const colon = line.indexOf(':');
+        if (colon < 0) { continue; }
+        const provider = line.slice(0, colon) as 'claude' | 'codex';
+        const linuxBase = line.slice(colon + 1);
+        const dir = `\\\\wsl$\\${distro}` + linuxBase.replace(/\//g, '\\');
+        result.push({ dir, provider, wslDistro: distro, linuxBase });
+        console.log(`[TokenTracker] WSL exec found ${provider}: wsl://${distro}${linuxBase}`);
+      }
+    } catch (err) {
+      console.log(`[TokenTracker] WSL exec probe failed for "${distro}":`, err instanceof Error ? err.message : String(err));
+    }
+  }
+  return result;
 }
 
 function findCodexSessionDirs(): string[] {
@@ -138,26 +220,84 @@ function findCodexSessionDirs(): string[] {
 }
 
 function findAllLogDirs(override: string): LogRoot[] {
-  if (override) return [{ dir: override, provider: override.toLowerCase().includes('.codex') ? 'codex' : 'claude' }];
+  if (override) {
+    const provider = override.toLowerCase().includes('.codex') ? 'codex' as const : 'claude' as const;
+
+    // If the override is an inaccessible UNC path, try wsl.exe exec mode instead
+    if (isUncPath(override) && !fs.existsSync(override)) {
+      const m = override.match(/^\\\\wsl[^\\]*\\([^\\]+)\\(.+)$/i);
+      if (m) {
+        const distro = m[1];
+        const linuxBase = '/' + m[2].replace(/\\/g, '/');
+        try {
+          const exists = execFileSync('wsl.exe', ['-d', distro, '--', 'sh', '-c', `[ -d "${linuxBase}" ] && echo yes`], { timeout: 5000 }).toString().trim();
+          if (exists === 'yes') {
+            console.log(`[TokenTracker] UNC override inaccessible, switching to wsl.exe exec mode: ${distro}${linuxBase}`);
+            return [{ dir: override, provider, wslDistro: distro, linuxBase }];
+          }
+        } catch { /* fall through to regular mode */ }
+      }
+    }
+
+    return [{ dir: override, provider }];
+  }
 
   const dirs: LogRoot[] = [];
 
   const native = path.join(os.homedir(), '.claude', 'projects');
-  if (fs.existsSync(native)) dirs.push({ dir: native, provider: 'claude' });
+  if (fs.existsSync(native)) { dirs.push({ dir: native, provider: 'claude' }); }
 
   for (const dir of findCodexSessionDirs()) {
     dirs.push({ dir, provider: 'codex' });
   }
 
-  // Auto-detect WSL installs on Windows hosts
   if (os.platform() === 'win32') {
-    dirs.push(...findWslClaudeDirs().map(dir => ({ dir, provider: 'claude' as const })));
-    dirs.push(...findWslCodexSessionDirs().map(dir => ({ dir, provider: 'codex' as const })));
+    // Phase 1: UNC paths via Node.js fs (these only include dirs that pass fs.existsSync)
+    const distros = getWslDistros();
+    const uncClaude: string[] = [];
+    const uncCodex:  string[] = [];
+    for (const distro of distros) {
+      const home = tryReadHome(distro);
+      if (home) {
+        for (const user of home.users) {
+          const cp = `\\\\wsl$\\${distro}\\home\\${user}\\.claude\\projects`;
+          if (fs.existsSync(cp)) { uncClaude.push(cp); }
+          for (const dot of ['.codex', '.Codex']) {
+            const xp = `\\\\wsl$\\${distro}\\home\\${user}\\${dot}\\sessions`;
+            if (fs.existsSync(xp)) { uncCodex.push(xp); }
+          }
+        }
+      }
+      const rcp = `\\\\wsl$\\${distro}\\root\\.claude\\projects`;
+      if (fs.existsSync(rcp)) { uncClaude.push(rcp); }
+      for (const dot of ['.codex', '.Codex']) {
+        const rxp = `\\\\wsl$\\${distro}\\root\\${dot}\\sessions`;
+        if (fs.existsSync(rxp)) { uncCodex.push(rxp); }
+      }
+    }
+    for (const dir of uncClaude) { dirs.push({ dir, provider: 'claude' }); }
+    for (const dir of uncCodex)  { dirs.push({ dir, provider: 'codex' }); }
+
+    // Track which distros are covered by UNC so we don't double-watch them
+    const distrosWithUnc = new Set<string>();
+    for (const dir of [...uncClaude, ...uncCodex]) {
+      const m = dir.match(/^\\\\wsl[^\\]*\\([^\\]+)\\/i);
+      if (m) { distrosWithUnc.add(m[1].toLowerCase()); }
+    }
+
+    // Phase 2: wsl.exe exec for distros where UNC is inaccessible
+    for (const root of findWslRootsViaExec()) {
+      if (!distrosWithUnc.has((root.wslDistro ?? '').toLowerCase())) {
+        dirs.push(root);
+      }
+    }
   }
 
   const seen = new Set<string>();
   return dirs.filter(root => {
-    const key = `${root.provider}:${path.normalize(root.dir).toLowerCase()}`;
+    const key = root.linuxBase
+      ? `${root.provider}:wsl:${root.wslDistro}:${root.linuxBase}`
+      : `${root.provider}:${path.normalize(root.dir).toLowerCase()}`;
     if (seen.has(key)) { return false; }
     seen.add(key);
     return true;
@@ -371,6 +511,77 @@ function tailCodexFile(filePath: string): boolean {
   return hadRateLimit;
 }
 
+// ── wsl.exe file readers (bypass Node.js fs for WSL paths) ───────────────
+
+function tailFileViaWsl(distro: string, linuxPath: string): boolean {
+  const key = `wsl:${distro}:${linuxPath}`;
+  const currentOffset = getOffset(key);
+  let buf: Buffer;
+  try {
+    buf = wslExec(distro, `tail -c +${currentOffset + 1} "${linuxPath}" 2>/dev/null`);
+  } catch { return false; }
+  if (buf.length === 0) { return false; }
+  setOffset(key, currentOffset + buf.length);
+
+  const sessionFile = path.basename(linuxPath, '.jsonl');
+  const lines = buf.toString('utf8').split('\n');
+
+  let project = linuxPath.split('/').slice(-2, -1)[0] ?? 'unknown';
+  for (const line of lines) {
+    if (!line.trim()) { continue; }
+    try { const e: ClaudeLogEntry = JSON.parse(line); if (e.cwd) { project = e.cwd; break; } } catch { /* */ }
+  }
+
+  let startedAt = new Date().toISOString();
+  for (const line of lines) {
+    if (!line.trim()) { continue; }
+    try { const e: ClaudeLogEntry = JSON.parse(line); if (e.timestamp) { startedAt = e.timestamp; break; } } catch { /* */ }
+  }
+
+  const sessionId = upsertSession(sessionFile, startedAt, project, 'claude');
+  let hadRateLimit = false;
+  for (const line of lines) {
+    if (processLine(line, sessionId, project) === 'ratelimit') { hadRateLimit = true; }
+  }
+  return hadRateLimit;
+}
+
+function tailCodexFileViaWsl(distro: string, linuxPath: string): boolean {
+  const key = `wsl:${distro}:${linuxPath}`;
+  const currentOffset = getOffset(key);
+  let buf: Buffer;
+  try {
+    buf = wslExec(distro, `tail -c +${currentOffset + 1} "${linuxPath}" 2>/dev/null`);
+  } catch { return false; }
+  if (buf.length === 0) { return false; }
+  setOffset(key, currentOffset + buf.length);
+
+  const sessionFile = `codex:${path.basename(linuxPath, '.jsonl')}`;
+  const lines = buf.toString('utf8').split('\n');
+
+  let project = linuxPath.split('/').slice(-2, -1)[0] ?? 'unknown';
+  let startedAt: string | undefined;
+  for (const line of lines) {
+    if (!line.trim()) { continue; }
+    try {
+      const e: ClaudeLogEntry = JSON.parse(line);
+      if (!startedAt && e.timestamp) { startedAt = e.timestamp; }
+      if (e.type === 'session_meta') {
+        project = e.payload?.cwd ?? project;
+        startedAt = e.payload?.timestamp ?? e.timestamp ?? startedAt;
+        break;
+      }
+    } catch { /* */ }
+  }
+
+  const sessionId = upsertSession(sessionFile, startedAt ?? new Date().toISOString(), project, 'codex');
+  let hadRateLimit = false;
+  for (const line of lines) {
+    if (processCodexLine(line, sessionId, project) === 'ratelimit') { hadRateLimit = true; }
+  }
+  return hadRateLimit;
+}
+
 // ── async scan of a root directory ────────────────────────────────────────
 
 function yieldToEventLoop(): Promise<void> {
@@ -441,6 +652,31 @@ async function scanAllAsync(rootDir: string, provider: LogRoot['provider'], onCh
   onChange();
 }
 
+async function scanAllAsyncViaWsl(root: LogRoot, onChange: () => void, onRateLimit?: () => void): Promise<void> {
+  const { wslDistro, linuxBase, provider } = root;
+  if (!wslDistro || !linuxBase) { return; }
+
+  const maxDepth = provider === 'codex' ? 5 : 2;
+  const files = wslListJsonl(wslDistro, linuxBase, maxDepth);
+  let anyRateLimit = false;
+
+  for (const { linuxPath, size } of files) {
+    await yieldToEventLoop();
+    if (size <= getOffset(`wsl:${wslDistro}:${linuxPath}`)) { continue; }
+    try {
+      const hadRateLimit = provider === 'codex'
+        ? tailCodexFileViaWsl(wslDistro, linuxPath)
+        : tailFileViaWsl(wslDistro, linuxPath);
+      if (hadRateLimit) { anyRateLimit = true; }
+    } catch (err) {
+      console.error(`[TokenTracker] WSL exec error processing ${linuxPath}:`, err);
+    }
+  }
+
+  onChange();
+  if (anyRateLimit) { onRateLimit?.(); }
+}
+
 // ── directory watcher ──────────────────────────────────────────────────────
 
 const watchers:      fs.FSWatcher[] = [];
@@ -474,24 +710,33 @@ function watchProjectDir(
   watchers.push(watcher);
 }
 
-function startWatchingDir(
-  rootDir: string,
-  provider: LogRoot['provider'],
-  onChange: () => void,
-  onRateLimit?: () => void
-): void {
-  watchedDirs.push(rootDir);
+function startWatchingDir(root: LogRoot, onChange: () => void, onRateLimit?: () => void): void {
+  watchedDirs.push(root.dir);
 
-  // Always do an initial async scan regardless of path type
-  scanAllAsync(rootDir, provider, onChange).catch(err =>
+  // WSL exec mode — bypass Node.js fs entirely, always poll
+  if (root.wslDistro) {
+    console.log(`[TokenTracker] WSL exec mode, polling every ${WSL_POLL_MS / 1000}s: wsl://${root.wslDistro}${root.linuxBase}`);
+    scanAllAsyncViaWsl(root, onChange, onRateLimit).catch(err =>
+      console.error('[TokenTracker] WSL exec initial scan error:', err)
+    );
+    const id = setInterval(() => {
+      scanAllAsyncViaWsl(root, onChange, onRateLimit).catch(err =>
+        console.error('[TokenTracker] WSL exec poll error:', err)
+      );
+    }, WSL_POLL_MS);
+    pollIntervals.push(id);
+    return;
+  }
+
+  // Node.js fs mode (native or UNC path)
+  scanAllAsync(root.dir, root.provider, onChange).catch(err =>
     console.error('[TokenTracker] Error during initial scan:', err)
   );
 
-  if (isUncPath(rootDir)) {
-    // fs.watch is unreliable on UNC paths (\\wsl$) — poll instead
-    console.log(`[TokenTracker] WSL path detected, polling every ${WSL_POLL_MS / 1000}s: ${rootDir}`);
+  if (isUncPath(root.dir)) {
+    console.log(`[TokenTracker] WSL UNC path, polling every ${WSL_POLL_MS / 1000}s: ${root.dir}`);
     const id = setInterval(() => {
-      scanAllAsync(rootDir, provider, onChange).catch(err =>
+      scanAllAsync(root.dir, root.provider, onChange).catch(err =>
         console.error('[TokenTracker] WSL poll error:', err)
       );
     }, WSL_POLL_MS);
@@ -499,11 +744,11 @@ function startWatchingDir(
     return;
   }
 
-  // Native path: use fs.watch for real-time updates
+  // Native path: fs.watch for real-time updates (Codex always polls)
   try {
-    if (provider === 'codex') {
+    if (root.provider === 'codex') {
       const id = setInterval(() => {
-        scanAllAsync(rootDir, provider, onChange).catch(err =>
+        scanAllAsync(root.dir, root.provider, onChange).catch(err =>
           console.error('[TokenTracker] Codex poll error:', err)
         );
       }, WSL_POLL_MS);
@@ -511,18 +756,18 @@ function startWatchingDir(
       return;
     }
 
-    const rootWatcher = fs.watch(rootDir, { recursive: false }, (event, filename) => {
+    const rootWatcher = fs.watch(root.dir, { recursive: false }, (event, filename) => {
       if (!filename) { return; }
-      const fullPath = path.join(rootDir, filename);
+      const fullPath = path.join(root.dir, filename);
       if (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory()) {
-        watchProjectDir(fullPath, provider, onChange, onRateLimit);
+        watchProjectDir(fullPath, root.provider, onChange, onRateLimit);
       }
     });
     watchers.push(rootWatcher);
 
-    for (const entry of fs.readdirSync(rootDir, { withFileTypes: true })) {
+    for (const entry of fs.readdirSync(root.dir, { withFileTypes: true })) {
       if (entry.isDirectory()) {
-        watchProjectDir(path.join(rootDir, entry.name), provider, onChange, onRateLimit);
+        watchProjectDir(path.join(root.dir, entry.name), root.provider, onChange, onRateLimit);
       }
     }
   } catch (err) {
@@ -544,7 +789,7 @@ export function startWatching(
 
   for (const root of dirs) {
     console.log(`[TokenTracker] Watching ${root.provider}: ${root.dir}`);
-    startWatchingDir(root.dir, root.provider, onChange, onRateLimit);
+    startWatchingDir(root, onChange, onRateLimit);
   }
 }
 
