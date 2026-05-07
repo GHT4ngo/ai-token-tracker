@@ -69,7 +69,7 @@ function pushExisting(found: string[], dir: string, label: string): void {
   found.push(dir);
 }
 
-function findWslClaudeDirs(): string[] {
+export function findWslClaudeDirs(): string[] {
   const found: string[] = [];
   for (const distro of getWslDistros()) {
     // /home/* (regular users)
@@ -88,7 +88,7 @@ function findWslClaudeDirs(): string[] {
   return found;
 }
 
-function findWslCodexSessionDirs(): string[] {
+export function findWslCodexSessionDirs(): string[] {
   const found: string[] = [];
   for (const distro of getWslDistros()) {
     try {

@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { initDb } from './db';
-import { startWatching, stopWatching, getWatchedDirs } from './logParser';
+import { startWatching, stopWatching, getWatchedDirs, findWslClaudeDirs, findWslCodexSessionDirs } from './logParser';
 import { createStatusBar, refresh as refreshBar, showRateLimitWarning } from './statusBar';
 import { showPanel, refreshPanel } from './webviewPanel';
 import { queryProjects } from './db';
@@ -88,19 +88,41 @@ function activateInner(context: vscode.ExtensionContext): void {
         ? `Watching ${watched.length} path(s) · ${sessions} sessions loaded`
         : 'No log directory found — choose an option below';
 
-      type DiagnoseAction = { label: string; detail: string; id: 'browse' | 'manual' | 'auto'; };
+      type DiagnoseAction = { label: string; detail: string; id: 'wsl' | 'browse' | 'manual' | 'auto'; };
       const choice = await vscode.window.showQuickPick<DiagnoseAction>(
         [
-          { label: '$(folder-opened) Browse for folder…',     detail: 'Pick the .claude/projects or .codex/sessions folder with a file dialog', id: 'browse' },
-          { label: '$(edit) Enter path manually',             detail: 'Paste a UNC or local path — useful for WSL paths', id: 'manual' },
-          { label: '$(sync) Auto-detect (clear custom path)', detail: 'Let the extension scan for Claude Code and Codex automatically', id: 'auto' },
+          { label: '$(search) Scan WSL distros for log folders', detail: 'Automatically find .claude/projects and .codex/sessions across all WSL distros', id: 'wsl' },
+          { label: '$(folder-opened) Browse for folder…',        detail: 'File dialog — works for native Windows paths only, not WSL', id: 'browse' },
+          { label: '$(edit) Enter path manually',                detail: 'Paste a UNC or local path', id: 'manual' },
+          { label: '$(sync) Auto-detect (clear custom path)',    detail: 'Let the extension scan for Claude Code and Codex automatically', id: 'auto' },
         ],
         { title: `AI Token Tracker — ${statusLine}`, placeHolder: 'How would you like to set the log path?' }
       );
 
       if (!choice) { return; }
 
-      // ── Browse via file dialog ────────────────────────────────────────────
+      // ── Scan WSL distros ──────────────────────────────────────────────────
+      if (choice.id === 'wsl') {
+        const found = [...findWslClaudeDirs(), ...findWslCodexSessionDirs()];
+        if (found.length === 0) {
+          vscode.window.showWarningMessage(
+            'No WSL log folders found. Make sure WSL is running and Claude Code or Codex has been used at least once inside it.'
+          );
+          return;
+        }
+        type PathItem = vscode.QuickPickItem & { path: string };
+        const picked = await vscode.window.showQuickPick<PathItem>(
+          found.map(p => ({ label: p.split('\\').pop() ?? p, detail: p, path: p })),
+          { title: 'Found WSL log folders — pick one to watch', placeHolder: 'Select a folder' }
+        );
+        if (!picked) { return; }
+        await vscode.workspace.getConfiguration('tokenTracker').update('logDirectory', picked.path, vscode.ConfigurationTarget.Global);
+        restartWatcher(picked.path);
+        vscode.window.showInformationMessage(`Token Tracker: now watching "${picked.path}". Data will update shortly.`);
+        return;
+      }
+
+      // ── Browse via file dialog (Windows local paths only) ─────────────────
       if (choice.id === 'browse') {
         const uris = await vscode.window.showOpenDialog({
           canSelectFiles:   false,
@@ -112,10 +134,6 @@ function activateInner(context: vscode.ExtensionContext): void {
         if (!uris || uris.length === 0) { return; }
         const selected   = uris[0].fsPath;
         const normalized = normalizeWslPath(selected);
-        if (!fs.existsSync(normalized)) {
-          vscode.window.showErrorMessage(`Token Tracker: folder not found after selection — "${normalized}"`);
-          return;
-        }
         await vscode.workspace.getConfiguration('tokenTracker').update('logDirectory', normalized, vscode.ConfigurationTarget.Global);
         restartWatcher(normalized);
         vscode.window.showInformationMessage(`Token Tracker: now watching "${normalized}". Data will update shortly.`);
