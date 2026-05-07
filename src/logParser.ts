@@ -45,22 +45,39 @@ interface LogRoot {
 
 // ── directory discovery ────────────────────────────────────────────────────
 
+// UNC server names to try — wsl$ works on Win10+, wsl.localhost on Win11 only.
+// Node.js fs handles wsl$ more reliably; try both when scanning.
+const WSL_SERVERS = ['wsl$', 'wsl.localhost'];
+
 function getWslDistros(): string[] {
-  try {
-    // wsl -l -q outputs UTF-16 LE on Windows
-    const raw = execSync('wsl -l -q', { timeout: 5000 });
-    const distros = raw
-      .toString('utf16le')
-      .replace(/\0/g, '')
-      .split(/\r?\n/)
-      .map(s => s.trim())
-      .filter(Boolean);
-    console.log(`[TokenTracker] WSL distros found: ${distros.join(', ')}`);
-    return distros;
-  } catch {
-    console.log('[TokenTracker] WSL not available or wsl command failed');
-    return [];
+  const distros = new Set<string>();
+
+  // Method 1: read \\wsl$\ and \\wsl.localhost\ as directories directly.
+  // This avoids the wsl -l -q subprocess and UTF-16 encoding issues.
+  for (const server of WSL_SERVERS) {
+    try {
+      for (const d of fs.readdirSync(`\\\\${server}\\`)) {
+        if (d && !d.startsWith('.')) { distros.add(d); }
+      }
+    } catch { /* server not accessible */ }
   }
+
+  // Method 2: wsl -l -q fallback (UTF-16 LE output)
+  if (distros.size === 0) {
+    try {
+      const raw = execSync('wsl -l -q', { timeout: 5000 });
+      raw.toString('utf16le')
+        .replace(/\0/g, '')
+        .split(/\r?\n/)
+        .map(s => s.trim())
+        .filter(Boolean)
+        .forEach(d => distros.add(d));
+    } catch { /* WSL not available */ }
+  }
+
+  const result = [...distros];
+  console.log(`[TokenTracker] WSL distros: ${result.join(', ') || '(none found)'}`);
+  return result;
 }
 
 function pushExisting(found: string[], dir: string, label: string): void {
@@ -69,21 +86,28 @@ function pushExisting(found: string[], dir: string, label: string): void {
   found.push(dir);
 }
 
+// Try both \\wsl$\ and \\wsl.localhost\ for a given sub-path; return first accessible home dir list.
+function tryReadHome(distro: string): { server: string; users: string[] } | null {
+  for (const server of WSL_SERVERS) {
+    try {
+      const users = fs.readdirSync(`\\\\${server}\\${distro}\\home`);
+      return { server, users };
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
 export function findWslClaudeDirs(): string[] {
   const found: string[] = [];
   for (const distro of getWslDistros()) {
-    // /home/* (regular users)
-    try {
-      const homeBase = `\\\\wsl$\\${distro}\\home`;
-      for (const user of fs.readdirSync(homeBase)) {
-        pushExisting(found, `${homeBase}\\${user}\\.claude\\projects`, 'WSL Claude dir');
+    const home = tryReadHome(distro);
+    if (home) {
+      for (const user of home.users) {
+        // Always store as \\wsl$\ for better Node.js fs compat
+        pushExisting(found, `\\\\wsl$\\${distro}\\home\\${user}\\.claude\\projects`, 'WSL Claude dir');
       }
-    } catch { /* distro stopped or no /home */ }
-
-    // /root
-    try {
-      pushExisting(found, `\\\\wsl$\\${distro}\\root\\.claude\\projects`, 'WSL Claude dir (root)');
-    } catch { /* ignore */ }
+    }
+    pushExisting(found, `\\\\wsl$\\${distro}\\root\\.claude\\projects`, 'WSL Claude dir (root)');
   }
   return found;
 }
@@ -91,18 +115,15 @@ export function findWslClaudeDirs(): string[] {
 export function findWslCodexSessionDirs(): string[] {
   const found: string[] = [];
   for (const distro of getWslDistros()) {
-    try {
-      const homeBase = `\\\\wsl$\\${distro}\\home`;
-      for (const user of fs.readdirSync(homeBase)) {
-        pushExisting(found, `${homeBase}\\${user}\\.codex\\sessions`, 'WSL Codex sessions dir');
-        pushExisting(found, `${homeBase}\\${user}\\.Codex\\sessions`, 'WSL Codex sessions dir');
+    const home = tryReadHome(distro);
+    if (home) {
+      for (const user of home.users) {
+        pushExisting(found, `\\\\wsl$\\${distro}\\home\\${user}\\.codex\\sessions`,  'WSL Codex dir');
+        pushExisting(found, `\\\\wsl$\\${distro}\\home\\${user}\\.Codex\\sessions`,  'WSL Codex dir');
       }
-    } catch { /* distro stopped or no /home */ }
-
-    try {
-      pushExisting(found, `\\\\wsl$\\${distro}\\root\\.codex\\sessions`, 'WSL Codex sessions dir (root)');
-      pushExisting(found, `\\\\wsl$\\${distro}\\root\\.Codex\\sessions`, 'WSL Codex sessions dir (root)');
-    } catch { /* ignore */ }
+    }
+    pushExisting(found, `\\\\wsl$\\${distro}\\root\\.codex\\sessions`, 'WSL Codex dir (root)');
+    pushExisting(found, `\\\\wsl$\\${distro}\\root\\.Codex\\sessions`, 'WSL Codex dir (root)');
   }
   return found;
 }

@@ -112,9 +112,18 @@ function activateInner(context: vscode.ExtensionContext): void {
       if (choice.id === 'wsl') {
         const found = [...findWslClaudeDirs(), ...findWslCodexSessionDirs()];
         if (found.length === 0) {
-          vscode.window.showWarningMessage(
-            'No WSL log folders found. Make sure WSL is running and Claude Code or Codex has been used at least once inside it.'
+          const action = await vscode.window.showWarningMessage(
+            'No WSL log folders found automatically.\n\n' +
+            'The most reliable fix when Claude Code runs inside WSL is to open VS Code ' +
+            'connected to WSL — the extension will then find logs automatically without any path setup.',
+            'How to connect VS Code to WSL',
+            'Enter path manually'
           );
+          if (action === 'How to connect VS Code to WSL') {
+            vscode.env.openExternal(vscode.Uri.parse('https://code.visualstudio.com/docs/remote/wsl'));
+          } else if (action === 'Enter path manually') {
+            vscode.commands.executeCommand('tokenTracker.diagnose');
+          }
           return;
         }
         type PathItem = vscode.QuickPickItem & { path: string };
