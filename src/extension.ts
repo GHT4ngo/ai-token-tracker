@@ -25,15 +25,22 @@ function cfg<T>(key: string): T {
 function normalizeWslPath(raw: string): string {
   let p = raw.trim();
 
-  // Already a proper UNC path — just normalise slashes
-  if (p.startsWith('\\\\')) {
-    return p.replace(/\//g, '\\');
+  // Forward-slash UNC from VS Code URI: //wsl.localhost/... or //wsl$/...
+  if (/^\/\/wsl[\.$]/i.test(p)) {
+    p = '\\\\' + p.slice(2).replace(/\//g, '\\');
+  }
+  // Without leading slashes: wsl.localhost\... or wsl$/...
+  else if (/^wsl[\.$]/i.test(p)) {
+    p = '\\\\' + p.replace(/\//g, '\\');
+  }
+  // Already a UNC path — just normalise forward slashes
+  else if (p.startsWith('\\\\')) {
+    p = p.replace(/\//g, '\\');
   }
 
-  // Starts with wsl.localhost or wsl$ (without leading \\)
-  if (/^wsl[\.$]/i.test(p)) {
-    return '\\\\' + p.replace(/\//g, '\\');
-  }
+  // \\wsl.localhost\ is Windows 11 only and unreliable in Node.js fs.
+  // \\wsl$\ works on both Windows 10 and 11 — always prefer it.
+  p = p.replace(/^\\\\wsl\.localhost\\/i, '\\\\wsl$\\');
 
   return p;
 }
