@@ -316,6 +316,23 @@ export function queryDailyByProvider(days: number): DailyByProvider[] {
     bucket.output   += s.output_tokens;
     bucket.cost_usd += s.cost_usd;
   }
+
+  // Fill in zero-value entries for every calendar day in the range so the
+  // chart x-axis reflects actual time rather than just days-with-data.
+  const cursor = new Date(cutoff);
+  const today  = new Date();
+  while (cursor <= today) {
+    const dateStr = cursor.toISOString().slice(0, 10);
+    if (!byDate[dateStr]) {
+      byDate[dateStr] = {
+        date: dateStr,
+        claude: { input: 0, output: 0, cost_usd: 0 },
+        codex:  { input: 0, output: 0, cost_usd: 0 },
+      };
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
   return Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
 }
 
