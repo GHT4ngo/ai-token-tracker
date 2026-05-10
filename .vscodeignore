@@ -9,3 +9,7 @@ src/**
 frontend_repo/**
 frontend/**
 node_modules/**
+.codex-git-index
+.codex-temp-index
+.codex-git-objects/**
+AGENTS.md

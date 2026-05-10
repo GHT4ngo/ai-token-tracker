@@ -31,20 +31,25 @@ If those logs do not exist yet, the extension will open normally but usage will 
 
 ## What it does
 
-The status bar shows live stats while you work:
+The status bar shows live stats while you work. When there is activity, it displays:
 
-```text
-AI 12.4k - $0.18 - sonnet-4-6
-```
+- **⬡** — the token tracker hex icon (click to open panel)
+- **Purple number** — Claude Code tokens used today
+- **Cyan number** — Codex tokens used today (shown only when Codex has activity)
+- **Colored dot** — estimated quota health: green below 50% used, yellow 50–80%, red above 80%
 
-Click it to open a summary panel inside VS Code:
+When nothing has been recorded yet, only the **⬡** icon is shown.
 
-- Today / 7-day / 30-day cost and token totals
-- Activity chart with 90-day, 30-day, 7-day, and 3-day ranges
-- Estimated cost chart over the selected range
+Click the status bar to open a summary panel inside VS Code:
+
+- **Stats tab**: Today / 7-day / 30-day cost and token totals
+- Separate activity charts for Claude Code and Codex with soft bezier curves
+- Click **⤢ zoom** on any chart to expand it to fill the panel; press Escape or click outside to close
 - Softcap markers and provider risk cards when logs include limit signals
-- Projects table with Claude Code and Codex listed as separate engine rows
+- Estimated quota usage tracker at the bottom showing each engine's usage bar
+- Projects table with Claude Code and Codex as separate engine rows
 - Rate-limit events table for recent pauses or softcap windows
+- **Memory tab**: Extension host heap usage and a list of all active VS Code extensions
 
 Costs are retail API equivalents for planning only. They are not your actual subscription bill.
 

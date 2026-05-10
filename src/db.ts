@@ -446,6 +446,27 @@ function riskRow(
   return { provider, used_percent, confidence, resets_at: resetsAt, status };
 }
 
+export interface TodayByProvider {
+  claude: { input: number; output: number; };
+  codex:  { input: number; output: number; };
+}
+
+export function queryTodayByProvider(): TodayByProvider {
+  const today = todayStartIso();
+  const result: TodayByProvider = {
+    claude: { input: 0, output: 0 },
+    codex:  { input: 0, output: 0 },
+  };
+  for (const s of store.sessions) {
+    if (s.started_at < today) { continue; }
+    const provider = s.provider ?? inferProvider(s.model, s.session_file);
+    const bucket = provider === 'codex' ? result.codex : result.claude;
+    bucket.input  += s.input_tokens;
+    bucket.output += s.output_tokens;
+  }
+  return result;
+}
+
 export function queryTodayTotals(): LiveTotals {
   const today = todayStartIso();
   const row = querySummary(today);
