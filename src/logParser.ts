@@ -489,12 +489,49 @@ function processCodexLine(line: string, sessionId: number, project: string): Lin
   return inputTokens > 0 || outputTokens > 0 || cacheRead > 0 ? 'message' : null;
 }
 
+// Read the last ~4 KB of a Codex file to extract rate-limit snapshots without
+// reprocessing token data. Called when the file offset is already at EOF.
+function peekLastCodexRateLimits(filePath: string, project: string): void {
+  let fileSize: number;
+  try { fileSize = fs.statSync(filePath).size; } catch { return; }
+  if (fileSize === 0) { return; }
+
+  const peekSize = Math.min(4096, fileSize);
+  const fd = fs.openSync(filePath, 'r');
+  const buf = Buffer.alloc(peekSize);
+  fs.readSync(fd, buf, 0, peekSize, fileSize - peekSize);
+  fs.closeSync(fd);
+
+  const lines = buf.toString('utf8').split('\n').filter(Boolean).reverse();
+  for (const line of lines) {
+    try {
+      const entry: ClaudeLogEntry = JSON.parse(line);
+      if (entry.type !== 'event_msg' || entry.payload?.type !== 'token_count') { continue; }
+      const timestamp = entry.timestamp ?? new Date().toISOString();
+      const limits    = entry.payload.rate_limits;
+      const primary   = limits?.primary;
+      const secondary = limits?.secondary;
+      if (typeof primary?.used_percent === 'number') {
+        insertLimitSnapshot(timestamp, project, 'codex', parseUnixSeconds(primary.resets_at), primary.used_percent, 'primary');
+      }
+      if (typeof secondary?.used_percent === 'number') {
+        insertLimitSnapshot(timestamp, project, 'codex', parseUnixSeconds(secondary.resets_at), secondary.used_percent, 'secondary');
+      }
+      break; // most-recent entry found — stop
+    } catch { /* ignore malformed lines */ }
+  }
+}
+
 function tailCodexFile(filePath: string): boolean {
   const stats = fs.statSync(filePath);
   const currentOffset = getOffset(filePath);
 
   if (stats.size <= currentOffset) {
-    touchSessionLastActive(`codex:${path.basename(filePath, '.jsonl')}`, stats.mtime.toISOString());
+    const sessionKey = `codex:${path.basename(filePath, '.jsonl')}`;
+    touchSessionLastActive(sessionKey, stats.mtime.toISOString());
+    // Peek at the tail to backfill rate-limit snapshots (e.g. secondary window
+    // data added in v0.2.21 that the initial scan missed).
+    peekLastCodexRateLimits(filePath, path.basename(path.dirname(filePath)));
     return false;
   }
 
