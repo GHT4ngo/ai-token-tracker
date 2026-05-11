@@ -44,8 +44,10 @@ Click the status bar to open a summary panel inside VS Code:
 
 - **Stats tab**: Today / 7-day / 30-day cost and token totals
 - Separate activity charts for Claude Code and Codex with soft bezier curves
+- **Red cap bands** on activity charts — each day a quota cap was active is highlighted in red; 5-hour primary caps are light red, weekly caps are stronger red
 - Click **⤢ zoom** on any chart to expand it to fill the panel; press Escape or click outside to close
-- Softcap markers and provider risk cards when logs include limit signals
+- Provider risk cards with estimated usage percentage and reset time when logs include limit signals
+- **Cap Prediction card** — shows current usage rate (%/hr) and estimated time until the next cap for each active provider and window (5-hour and 7-day windows tracked separately for Codex)
 - Estimated quota usage tracker at the bottom showing each engine's usage bar
 - Projects table with Claude Code and Codex as separate engine rows
 - Rate-limit events table for recent pauses or softcap windows
@@ -63,6 +65,9 @@ Costs are retail API equivalents for planning only. They are not your actual sub
 - Per-project tracking tied to the recorded workspace or session path
 - Separate engine labels and colors in the projects table
 - Approximate usage display, avoiding overly exact token/limit claims
+- **Cap period bands** on charts — red columns mark every day a quota cap was active, saved historically so past caps remain visible after a window resets
+- **Cap rate prediction** — linear rate fit over recent snapshots estimates how many hours until the next 5-hour or 7-day cap, shown with color-coded urgency
+- **Weekly (secondary) window tracking** for Codex — captures the 7-day rolling usage window separately from the 5-hour window, with its own snapshot history and prediction
 - Softcap planning cards with estimated provider usage percentage when logs expose it
 - Auto-detects native Windows, macOS, Linux, and WSL log folders
 - Polling fallback for WSL/UNC paths where file watching is unreliable
@@ -76,7 +81,7 @@ Costs are retail API equivalents for planning only. They are not your actual sub
 
 Both Claude Code and Codex use token accounting in the same broad sense: prompts, tool context, file contents, and model replies are counted as input/output tokens. The exact internal accounting and subscription limits are provider-specific, so the extension treats local logs as the source of truth and shows estimates rather than exact quota numbers.
 
-Codex logs can include `token_count` events and sometimes rate-limit metadata such as used percentage and reset time. When available, the extension records those snapshots to estimate whether Codex is fresh, worth watching, low, or likely capped.
+Codex logs can include `token_count` events and rate-limit metadata for both the 5-hour primary window and the 7-day secondary window. When available, the extension records snapshots for each window separately, shows risk cards with estimated usage and reset time, draws red cap bands on the activity chart for every day a cap was active, and predicts time to the next cap based on your current usage rate.
 
 ---
 
@@ -130,10 +135,10 @@ Shown costs are retail API equivalents, informational only.
 | claude-opus-4-7 | $15/M | $75/M | $18.75/M | $1.50/M |
 | claude-sonnet-4-6 | $3/M | $15/M | $3.75/M | $0.30/M |
 | claude-haiku-4-5 | $0.80/M | $4/M | $1.00/M | $0.08/M |
-| gpt-5.3-codex | $1.25/M | $10/M | $0/M | $0.125/M |
-| gpt-5.2-codex | $1.25/M | $10/M | $0/M | $0.125/M |
-| gpt-5.1-codex | $1.25/M | $10/M | $0/M | $0.125/M |
-| gpt-5-codex | $1.25/M | $10/M | $0/M | $0.125/M |
+| gpt-5.3-codex | $1.75/M | $14/M | $0.175/M | $0.175/M |
+| gpt-5.2-codex | $1.75/M | $14/M | $0.175/M | $0.175/M |
+| gpt-5.1-codex | $1.25/M | $10/M | $0.125/M | $0.125/M |
+| gpt-5-codex | $1.25/M | $10/M | $0.125/M | $0.125/M |
 
 Edit `src/pricing.json` to update rates. The pricing file is copied into the extension bundle at build time.
 
