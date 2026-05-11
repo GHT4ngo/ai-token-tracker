@@ -7,6 +7,7 @@ export interface Session {
   id: number;
   session_file: string;
   started_at: string;
+  last_active_at?: string;
   project: string;
   provider: string;
   model: string;
@@ -119,12 +120,13 @@ export function addToSession(
 ): void {
   const s = store.sessions.find(s => s.id === sessionId);
   if (!s) { return; }
-  s.model = model;
+  s.model          = model;
   s.input_tokens  += inputTokens;
   s.output_tokens += outputTokens;
   s.cache_write   += cacheWrite;
   s.cache_read    += cacheRead;
   s.cost_usd      += costUsd;
+  s.last_active_at = new Date().toISOString();
   save();
 }
 
@@ -458,7 +460,9 @@ export function queryTodayByProvider(): TodayByProvider {
     codex:  { input: 0, output: 0 },
   };
   for (const s of store.sessions) {
-    if (s.started_at < today) { continue; }
+    // Use last_active_at if available so sessions that span midnight are included
+    const activeAt = s.last_active_at ?? s.started_at;
+    if (activeAt < today) { continue; }
     const provider = s.provider ?? inferProvider(s.model, s.session_file);
     const bucket = provider === 'codex' ? result.codex : result.claude;
     bucket.input  += s.input_tokens;
