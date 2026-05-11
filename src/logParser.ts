@@ -419,6 +419,9 @@ function tailFile(filePath: string): boolean /* hadRateLimit */ {
       hadRateLimit = true;
     }
   }
+  // Stamp last_active_at from file mtime so historical initial scans
+  // don't falsely appear as today's activity.
+  touchSessionLastActive(sessionFile, stats.mtime.toISOString());
   return hadRateLimit;
 }
 
@@ -516,6 +519,7 @@ function tailCodexFile(filePath: string): boolean {
       hadRateLimit = true;
     }
   }
+  touchSessionLastActive(sessionFile, stats.mtime.toISOString());
   return hadRateLimit;
 }
 

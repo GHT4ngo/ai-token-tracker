@@ -126,7 +126,8 @@ export function addToSession(
   s.cache_write   += cacheWrite;
   s.cache_read    += cacheRead;
   s.cost_usd      += costUsd;
-  s.last_active_at = new Date().toISOString();
+  // last_active_at is set from file mtime by the caller, not from wall clock,
+  // so historical files scanned for the first time don't appear as "today".
   save();
 }
 
@@ -220,7 +221,7 @@ export interface SummaryRow {
 }
 
 export function querySummary(fromDate: string): SummaryRow {
-  const filtered = store.sessions.filter(s => s.started_at >= fromDate);
+  const filtered = store.sessions.filter(s => (s.last_active_at ?? s.started_at) >= fromDate);
   return filtered.reduce(
     (acc, s) => ({
       input:    acc.input    + s.input_tokens,
