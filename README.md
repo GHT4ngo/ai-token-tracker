@@ -33,12 +33,17 @@ If those logs do not exist yet, the extension will open normally but usage will 
 
 The status bar shows live stats while you work. When there is activity, it displays:
 
+```
+⬡  79.2k ●  4.1M ●
+```
+
 - **⬡** — the token tracker hex icon (click to open panel)
 - **Purple number** — Claude Code tokens used today
-- **Cyan number** — Codex tokens used today (shown only when Codex has activity)
-- **Colored dot** — estimated quota health: green below 50% used, yellow 50–80%, red above 80%
+- **●** — Claude Code quota health (green / yellow / red)
+- **Cyan number** — Codex tokens used today
+- **●** — Codex quota health (green / yellow / red)
 
-When nothing has been recorded yet, only the **⬡** icon is shown.
+Each provider's dot is colored independently based on that provider's estimated usage. A provider's tokens and dot are hidden when it has no activity today. When nothing has been recorded yet, only the **⬡** icon is shown.
 
 Click the status bar to open a summary panel inside VS Code:
 
@@ -59,7 +64,7 @@ Costs are retail API equivalents for planning only. They are not your actual sub
 
 ## Features
 
-- Live status bar item, always visible while coding
+- Live status bar showing `⬡  [claude tokens] ●  [codex tokens] ●` — each colored dot reflects that provider's own quota health independently
 - Rich VS Code webview with inline SVG charts
 - Claude Code and Codex usage parsing from local JSONL logs
 - Per-project tracking tied to the recorded workspace or session path
@@ -68,6 +73,7 @@ Costs are retail API equivalents for planning only. They are not your actual sub
 - **Cap period bands** on charts — red columns mark every day a quota cap was active, saved historically so past caps remain visible after a window resets
 - **Cap rate prediction** — linear rate fit over recent snapshots estimates how many hours until the next 5-hour or 7-day cap, shown with color-coded urgency
 - **Weekly (secondary) window tracking** for Codex — captures the 7-day rolling usage window separately from the 5-hour window, with its own snapshot history and prediction
+- Backfills secondary window data from session files that were fully read before the weekly window was added — no re-scan needed
 - Softcap planning cards with estimated provider usage percentage when logs expose it
 - Auto-detects native Windows, macOS, Linux, and WSL log folders
 - Polling fallback for WSL/UNC paths where file watching is unreliable
