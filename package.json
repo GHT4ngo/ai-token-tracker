@@ -2,7 +2,7 @@
   "name": "ai-token-tracker",
   "displayName": "AI Token Tracker",
   "description": "Track Claude Code and Codex token usage, cost estimates, softcap signals, and per-project activity.",
-  "version": "0.2.17",
+  "version": "0.2.18",
   "publisher": "tango-solutions",
   "engines": {
     "vscode": "^1.85.0"

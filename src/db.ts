@@ -176,6 +176,14 @@ export function insertLimitSnapshot(
   save();
 }
 
+export function touchSessionLastActive(sessionFile: string, mtime: string): void {
+  const s = store.sessions.find(s => s.session_file === sessionFile);
+  if (!s) { return; }
+  if (s.last_active_at && s.last_active_at >= mtime) { return; }
+  s.last_active_at = mtime;
+  save();
+}
+
 // ── file offsets ──────────────────────────────────────────────────────────
 
 export function getOffset(filePath: string): number {
@@ -412,7 +420,15 @@ export function queryProviderRisk(days = 30): ProviderRiskRow[] {
     const latestObserved = recentSnapshots.find(r => (r.provider ?? 'codex') === provider && typeof r.used_percent === 'number')
       ?? providerLimits.find(r => typeof r.used_percent === 'number');
     if (latestObserved?.used_percent !== undefined) {
-      return riskRow(provider, latestObserved.used_percent, 'observed', latestObserved.resets_at);
+      const used      = latestObserved.used_percent;
+      const resetsAt  = latestObserved.resets_at;
+      const resetSoon = resetsAt && new Date(resetsAt) > new Date();
+      const staleMs   = Date.now() - new Date(latestObserved.timestamp).getTime();
+      const stale     = staleMs > 20 * 60 * 1000; // snapshot older than 20 min
+      // If a reset window is pending, usage was high, and we haven't seen a new
+      // snapshot in 20+ minutes — activity has stopped, infer capped.
+      const likelyCapped = resetSoon && used >= 70 && stale;
+      return riskRow(provider, likelyCapped ? 100 : used, likelyCapped ? 'estimated' : 'observed', resetsAt);
     }
 
     const capped = providerLimits[0];

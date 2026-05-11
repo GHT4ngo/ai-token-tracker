@@ -5,6 +5,7 @@ import { execSync, execFileSync } from 'child_process';
 import {
   upsertSession,
   addToSession,
+  touchSessionLastActive,
   insertRateLimit,
   insertLimitSnapshot,
   getOffset,
@@ -375,7 +376,11 @@ function tailFile(filePath: string): boolean /* hadRateLimit */ {
   const stats = fs.statSync(filePath);
   const currentOffset = getOffset(filePath);
 
-  if (stats.size <= currentOffset) { return false; }
+  if (stats.size <= currentOffset) {
+    // No new bytes — touch last_active_at so cross-midnight sessions stay visible
+    touchSessionLastActive(path.basename(filePath, '.jsonl'), stats.mtime.toISOString());
+    return false;
+  }
 
   const fd = fs.openSync(filePath, 'r');
   const length = stats.size - currentOffset;
@@ -473,7 +478,10 @@ function tailCodexFile(filePath: string): boolean {
   const stats = fs.statSync(filePath);
   const currentOffset = getOffset(filePath);
 
-  if (stats.size <= currentOffset) { return false; }
+  if (stats.size <= currentOffset) {
+    touchSessionLastActive(`codex:${path.basename(filePath, '.jsonl')}`, stats.mtime.toISOString());
+    return false;
+  }
 
   const fd = fs.openSync(filePath, 'r');
   const length = stats.size - currentOffset;
