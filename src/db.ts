@@ -26,6 +26,7 @@ export interface RateLimitEvent {
   provider?: string;
   resets_at?: string;
   used_percent?: number;
+  window_type?: 'primary' | 'secondary';
 }
 
 interface Store {
@@ -158,9 +159,11 @@ export function insertLimitSnapshot(
   project: string,
   provider: string,
   resetsAt?: string,
-  usedPercent?: number
+  usedPercent?: number,
+  windowType?: 'primary' | 'secondary'
 ): void {
-  const last = [...store.limitSnapshots].reverse().find(r => r.provider === provider);
+  const wt = windowType ?? 'primary';
+  const last = [...store.limitSnapshots].reverse().find(r => r.provider === provider && (r.window_type ?? 'primary') === wt);
   if (last && last.used_percent === usedPercent && last.resets_at === resetsAt) { return; }
   store.limitSnapshots.push({
     id: store.nextRateLimitId++,
@@ -170,9 +173,10 @@ export function insertLimitSnapshot(
     provider,
     resets_at: resetsAt,
     used_percent: usedPercent,
+    window_type: wt,
   });
-  if (store.limitSnapshots.length > 500) {
-    store.limitSnapshots = store.limitSnapshots.slice(-500);
+  if (store.limitSnapshots.length > 1000) {
+    store.limitSnapshots = store.limitSnapshots.slice(-1000);
   }
   save();
 }
@@ -491,4 +495,136 @@ export function queryTodayTotals(): LiveTotals {
   const today = todayStartIso();
   const row = querySummary(today);
   return { ...row, model: queryLatestModel() };
+}
+
+// ── cap periods (for chart bands) ─────────────────────────────────────────
+
+export interface CapPeriod {
+  start: string;
+  end: string;
+  provider: string;
+  window_type: 'primary' | 'secondary';
+}
+
+export function queryCapPeriods(days: number): CapPeriod[] {
+  const cutoff = daysAgoIso(days);
+  const periods: CapPeriod[] = [];
+
+  // Claude Code caps: derive from rate-limit events (provider === 'claude')
+  for (const rl of store.rateLimits) {
+    if (rl.timestamp < cutoff) { continue; }
+    if ((rl.provider ?? 'claude') !== 'claude') { continue; }
+    const end = rl.resets_at
+      ?? new Date(new Date(rl.timestamp).getTime() + rl.wait_seconds * 1000).toISOString();
+    periods.push({ start: rl.timestamp, end, provider: 'claude', window_type: 'primary' });
+  }
+
+  // Codex caps: derive from limit snapshots by detecting sustained high usage
+  const codexSnaps = store.limitSnapshots
+    .filter(r => r.timestamp >= cutoff && (r.provider ?? 'codex') === 'codex')
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+  const byWt = new Map<'primary' | 'secondary', RateLimitEvent[]>();
+  for (const s of codexSnaps) {
+    const wt = s.window_type ?? 'primary';
+    if (!byWt.has(wt)) { byWt.set(wt, []); }
+    byWt.get(wt)!.push(s);
+  }
+
+  for (const [window_type, snaps] of byWt.entries()) {
+    let inCap = false;
+    let capStart = '';
+    let capResets = '';
+
+    for (const s of snaps) {
+      const used = s.used_percent ?? 0;
+      if (!inCap && used >= 90) {
+        inCap = true;
+        capStart = s.timestamp;
+        capResets = s.resets_at ?? '';
+      } else if (inCap) {
+        if (s.resets_at && s.resets_at !== capResets && used < 50) {
+          // Window reset — end current period
+          periods.push({ start: capStart, end: s.timestamp, provider: 'codex', window_type });
+          inCap = false;
+        } else if (s.resets_at) {
+          capResets = s.resets_at;
+        }
+      }
+    }
+
+    if (inCap) {
+      const end = capResets || new Date().toISOString();
+      periods.push({ start: capStart, end, provider: 'codex', window_type });
+    }
+  }
+
+  return periods;
+}
+
+// ── cap rate predictions ──────────────────────────────────────────────────
+
+export interface CapPrediction {
+  provider: string;
+  window_type: 'primary' | 'secondary';
+  current_percent: number;
+  rate_per_hour: number;
+  hours_to_cap: number | null;
+  resets_at?: string;
+}
+
+export function queryCapPredictions(): CapPrediction[] {
+  const now = Date.now();
+  // Look back 4h for primary, 24h for secondary
+  const lookbackMs: Record<string, number> = { primary: 4 * 3600_000, secondary: 24 * 3600_000 };
+
+  const byKey = new Map<string, RateLimitEvent[]>();
+  for (const s of store.limitSnapshots) {
+    const wt = s.window_type ?? 'primary';
+    const cutoffMs = lookbackMs[wt] ?? 4 * 3600_000;
+    if (now - new Date(s.timestamp).getTime() > cutoffMs) { continue; }
+    const key = `${s.provider ?? 'codex'}:${wt}`;
+    if (!byKey.has(key)) { byKey.set(key, []); }
+    byKey.get(key)!.push(s);
+  }
+
+  const predictions: CapPrediction[] = [];
+
+  for (const [key, rawSnaps] of byKey.entries()) {
+    const [provider, wt] = key.split(':') as [string, 'primary' | 'secondary'];
+    const snaps = rawSnaps.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    if (snaps.length < 2) { continue; }
+
+    const latest = snaps[snaps.length - 1];
+    // Only use snapshots from the same window cycle (same resets_at)
+    const windowSnaps = latest.resets_at
+      ? snaps.filter(s => s.resets_at === latest.resets_at)
+      : snaps;
+    if (windowSnaps.length < 2) { continue; }
+
+    const first = windowSnaps[0];
+    const last  = windowSnaps[windowSnaps.length - 1];
+    const deltaPercent = (last.used_percent ?? 0) - (first.used_percent ?? 0);
+    const deltaMs = new Date(last.timestamp).getTime() - new Date(first.timestamp).getTime();
+    if (deltaMs <= 0 || deltaPercent <= 0) { continue; }
+
+    const ratePerHour = (deltaPercent / deltaMs) * 3_600_000;
+    const remaining = 100 - (last.used_percent ?? 0);
+    const hoursToCapFromNow = remaining > 0 && ratePerHour > 0 ? remaining / ratePerHour : null;
+
+    predictions.push({
+      provider,
+      window_type: wt,
+      current_percent: last.used_percent ?? 0,
+      rate_per_hour: ratePerHour,
+      hours_to_cap: hoursToCapFromNow,
+      resets_at: last.resets_at,
+    });
+  }
+
+  return predictions.sort((a, b) =>
+    a.provider !== b.provider
+      ? a.provider.localeCompare(b.provider)
+      : a.window_type === 'primary' ? -1 : 1
+  );
 }

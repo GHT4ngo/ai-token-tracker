@@ -461,16 +461,28 @@ function processCodexLine(line: string, sessionId: number, project: string): Lin
   }
 
   const limits = entry.payload.rate_limits;
-  const primary = limits?.primary;
-  const reached = limits?.rate_limit_reached_type;
-  const used = typeof primary?.used_percent === 'number' ? primary.used_percent : undefined;
-  if (used !== undefined || reached) {
+  const primary   = limits?.primary;
+  const secondary = limits?.secondary;
+  const reached   = limits?.rate_limit_reached_type;
+
+  const usedPrimary   = typeof primary?.used_percent   === 'number' ? primary.used_percent   : undefined;
+  const usedSecondary = typeof secondary?.used_percent === 'number' ? secondary.used_percent : undefined;
+
+  if (usedPrimary !== undefined || reached) {
     const resetsAt = parseUnixSeconds(primary?.resets_at);
     const wait = resetsAt ? Math.max(0, Math.round((new Date(resetsAt).getTime() - Date.now()) / 1000)) : 0;
-    insertLimitSnapshot(timestamp, project, 'codex', resetsAt, used);
-    if (reached || (used ?? 0) >= 95) {
-      insertRateLimit(timestamp, wait, project, 'codex', resetsAt, used);
+    insertLimitSnapshot(timestamp, project, 'codex', resetsAt, usedPrimary, 'primary');
+    if (reached || (usedPrimary ?? 0) >= 95) {
+      insertRateLimit(timestamp, wait, project, 'codex', resetsAt, usedPrimary);
     }
+  }
+
+  if (usedSecondary !== undefined) {
+    const resetsAtSec = parseUnixSeconds(secondary?.resets_at);
+    insertLimitSnapshot(timestamp, project, 'codex', resetsAtSec, usedSecondary, 'secondary');
+  }
+
+  if (usedPrimary !== undefined || reached || usedSecondary !== undefined) {
     return reached ? 'ratelimit' : 'message';
   }
 

@@ -10,6 +10,10 @@ import {
   DailyByProvider,
   queryProviderRisk,
   ProviderRiskRow,
+  queryCapPeriods,
+  CapPeriod,
+  queryCapPredictions,
+  CapPrediction,
 } from './db';
 
 let panel: vscode.WebviewPanel | undefined;
@@ -127,7 +131,8 @@ function buildProviderChart(
   provider: 'claude' | 'codex',
   color: string,
   gradId: string,
-  rlDates: Set<string>
+  rlDates: Set<string>,
+  capPeriods: CapPeriod[]
 ): string {
   const W = 760, H = 190;
   const P = { t: 22, r: 12, b: 26, l: 50 };
@@ -168,10 +173,25 @@ function buildProviderChart(
     return `<text x="${xOf(i).toFixed(1)}" y="${(H-4).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="currentColor" fill-opacity="0.4">${d.date.slice(5).replace('-', '/')}</text>`;
   }).join('');
 
-  const softcapLines = data.map((d, i) => {
-    if (!rlDates.has(d.date)) { return ''; }
-    return softcapLineSvg(xOf(i), xOf(Math.min(n - 1, i + 1)), P.t + 3);
+  // Cap bands: semi-transparent red columns for each day within a cap period
+  const colW   = n > 1 ? iW / (n - 1) : iW;
+  const halfCol = colW / 2;
+  const providerPeriods = capPeriods.filter(cp => cp.provider === provider);
+  const capBands = data.map((d, i) => {
+    const dayStart = d.date + 'T00:00:00.000Z';
+    const dayEnd   = d.date + 'T23:59:59.999Z';
+    const hasSecondary = providerPeriods.some(cp => cp.window_type === 'secondary' && cp.start <= dayEnd && cp.end >= dayStart);
+    const hasPrimary   = providerPeriods.some(cp => cp.window_type === 'primary'   && cp.start <= dayEnd && cp.end >= dayStart);
+    if (!hasPrimary && !hasSecondary) { return ''; }
+    const x    = xOf(i);
+    const rx   = Math.max(P.l, x - halfCol);
+    const rw   = Math.min(P.l + iW, x + halfCol) - rx;
+    // Secondary cap (weekly) gets a stronger red; primary (5h) is subtler
+    const fill  = hasSecondary ? 'rgba(248,113,113,0.28)' : 'rgba(248,113,113,0.15)';
+    const label = hasSecondary ? 'Weekly cap active' : '5h cap active';
+    return `<rect x="${rx.toFixed(1)}" y="${P.t.toFixed(1)}" width="${rw.toFixed(1)}" height="${iH.toFixed(1)}" fill="${fill}" rx="1"><title>${label} · ${d.date}</title></rect>`;
   }).join('');
+
   const markers = data.map((d, i) => {
     if (!rlDates.has(d.date)) { return ''; }
     return rlMarkerSvg(xOf(i), P.t - 8, `Rate limit · ${d.date.slice(5).replace('-', '/')}`);
@@ -188,9 +208,10 @@ function buildProviderChart(
       </linearGradient>
     </defs>
     ${grid}
+    ${capBands}
     <path d="${areaD}" fill="url(#${gradId})"/>
     <path d="${lineD}" fill="none" stroke="${color}" stroke-width="1.8" stroke-linejoin="round"/>
-    ${softcapLines}${xLabels}${markers}
+    ${xLabels}${markers}
   </svg>`;
 }
 
@@ -246,6 +267,50 @@ function buildUsageTracker(risks: ProviderRiskRow[]): string {
   return `<div class="usage-tracker">
     <div class="ut-title">Estimated quota usage</div>
     ${bars}
+  </div>`;
+}
+
+// ── Cap rate prediction card ──────────────────────────────────────────────────
+
+function buildCapPrediction(predictions: CapPrediction[]): string {
+  if (predictions.length === 0) { return ''; }
+
+  const rows = predictions.map(p => {
+    const providerLabel = p.provider === 'codex' ? 'Codex' : 'Claude Code';
+    const windowLabel   = p.window_type === 'secondary' ? '7-day' : '5h';
+    const rateStr       = `+${p.rate_per_hour.toFixed(1)}%/hr`;
+
+    let timeStr = '';
+    let timeColor = 'var(--green)';
+    if (p.hours_to_cap !== null) {
+      const h = p.hours_to_cap;
+      timeColor = h < 1 ? 'var(--red)' : h < 4 ? 'var(--yellow)' : 'var(--green)';
+      timeStr = h < 1
+        ? `~${Math.round(h * 60)}m to cap`
+        : h < 24
+          ? `~${h.toFixed(1)}h to cap`
+          : `~${(h / 24).toFixed(1)}d to cap`;
+    } else if (p.current_percent >= 95) {
+      timeColor = 'var(--red)';
+      timeStr = 'capped';
+    }
+
+    const resetsStr = p.resets_at
+      ? `resets ${new Date(p.resets_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+      : '';
+
+    return `<div class="pred-row">
+      <span class="pred-label">${esc(providerLabel)}</span>
+      <span class="pred-win dim">${esc(windowLabel)} window</span>
+      <span class="pred-rate dim">${rateStr}</span>
+      ${timeStr ? `<span class="pred-time" style="color:${timeColor}">${esc(timeStr)}</span>` : ''}
+      ${resetsStr ? `<span class="pred-resets dim">${esc(resetsStr)}</span>` : ''}
+    </div>`;
+  }).join('');
+
+  return `<div class="prediction-card">
+    <div class="pred-title">Cap Prediction</div>
+    ${rows}
   </div>`;
 }
 
@@ -424,6 +489,10 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
 
   const hasCodex  = daily.some(d => d.codex.input + d.codex.output > 0);
   const hasRl     = rlDates.size > 0;
+  const capPeriods      = queryCapPeriods(chartRange);
+  const capPredictions  = queryCapPredictions();
+  const hasCapPrediction = capPredictions.length > 0;
+  const hasCaps   = capPeriods.length > 0;
 
   const rateLimitRows = rl7.length
     ? rl7.map(r => `
@@ -439,8 +508,8 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   const statsActive  = activeTab === 'stats'  ? ' active' : '';
   const memActive    = activeTab === 'memory' ? ' active' : '';
 
-  const claudeChartHtml = buildProviderChart(daily, 'claude', '#a78bfa', 'gClaude', rlDates);
-  const codexChartHtml  = hasCodex ? buildProviderChart(daily, 'codex', '#22d3ee', 'gCodex', rlDates) : '';
+  const claudeChartHtml = buildProviderChart(daily, 'claude', '#a78bfa', 'gClaude', rlDates, capPeriods);
+  const codexChartHtml  = hasCodex ? buildProviderChart(daily, 'codex', '#22d3ee', 'gCodex', rlDates, capPeriods) : '';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -589,6 +658,17 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   .dim  { opacity:0.50; }
   .empty { text-align:center; padding:14px; opacity:0.38; }
 
+  /* Cap prediction */
+  .prediction-card { background:rgba(128,128,128,0.07); border:1px solid rgba(128,128,128,0.14); border-radius:10px; padding:13px 16px; margin-bottom:14px; }
+  .pred-title { font-size:0.72em; text-transform:uppercase; letter-spacing:.09em; font-weight:600; opacity:0.45; margin-bottom:10px; }
+  .pred-row { display:flex; align-items:center; gap:10px; margin-bottom:6px; flex-wrap:wrap; }
+  .pred-row:last-child { margin-bottom:0; }
+  .pred-label { font-size:0.78em; font-weight:700; min-width:90px; }
+  .pred-win { font-size:0.72em; min-width:75px; }
+  .pred-rate { font-size:0.74em; min-width:70px; }
+  .pred-time { font-size:0.78em; font-weight:700; }
+  .pred-resets { font-size:0.70em; }
+
   /* Footer */
   .footer { margin-top:20px; padding-top:12px; border-top:1px solid var(--vscode-panel-border); font-size:0.70em; opacity:0.45; line-height:1.6; }
 </style>
@@ -637,6 +717,8 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
 
   <div class="risk-grid">${buildRiskCards(risks)}</div>
 
+  ${hasCapPrediction ? buildCapPrediction(capPredictions) : ''}
+
   <!-- Claude Code activity chart -->
   <div class="chart-card" id="chart-claude">
     <div class="chart-head">
@@ -644,7 +726,8 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
       <div class="chart-legend">
         <span class="range-toggle">${buildRangeToggle(chartRange)}</span>
         <span class="legend-item"><span class="legend-dot" style="background:#a78bfa"></span>Claude Code</span>
-        ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Softcap</span>' : ''}
+        ${hasCaps ? '<span class="legend-item"><span class="legend-dot" style="background:rgba(248,113,113,0.6);border-radius:2px"></span>Cap active</span>' : ''}
+        ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Rate limit</span>' : ''}
         <span class="zoom-hint" data-zoom="chart-claude">⤢ zoom</span>
       </div>
     </div>
@@ -657,7 +740,8 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
       <span class="chart-title">Codex — tokens/day</span>
       <div class="chart-legend">
         <span class="legend-item"><span class="legend-dot" style="background:#22d3ee"></span>Codex</span>
-        ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Softcap</span>' : ''}
+        ${hasCaps ? '<span class="legend-item"><span class="legend-dot" style="background:rgba(248,113,113,0.6);border-radius:2px"></span>Cap active</span>' : ''}
+        ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Rate limit</span>' : ''}
         <span class="zoom-hint" data-zoom="chart-codex">⤢ zoom</span>
       </div>
     </div>
