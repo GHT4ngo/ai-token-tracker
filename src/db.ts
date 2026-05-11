@@ -179,8 +179,7 @@ export function insertLimitSnapshot(
 
 export function touchSessionLastActive(sessionFile: string, mtime: string): void {
   const s = store.sessions.find(s => s.session_file === sessionFile);
-  if (!s) { return; }
-  if (s.last_active_at && s.last_active_at >= mtime) { return; }
+  if (!s || s.last_active_at === mtime) { return; }
   s.last_active_at = mtime;
   save();
 }
