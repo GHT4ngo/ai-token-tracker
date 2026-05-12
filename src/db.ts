@@ -443,18 +443,51 @@ export function queryProviderRisk(days = 30): ProviderRiskRow[] {
 
   return [...providers].sort().map(provider => {
     const providerLimits = recentLimits.filter(r => r.provider === provider);
-    const latestObserved = recentSnapshots.find(r => (r.provider ?? 'codex') === provider && typeof r.used_percent === 'number')
-      ?? providerLimits.find(r => typeof r.used_percent === 'number');
-    if (latestObserved?.used_percent !== undefined) {
-      const used      = latestObserved.used_percent;
-      const resetsAt  = latestObserved.resets_at;
-      const resetSoon = resetsAt && new Date(resetsAt) > new Date();
-      const staleMs   = Date.now() - new Date(latestObserved.timestamp).getTime();
-      const stale     = staleMs > 20 * 60 * 1000; // snapshot older than 20 min
-      // If a reset window is pending, usage was high, and we haven't seen a new
-      // snapshot in 20+ minutes — activity has stopped, infer capped.
-      const likelyCapped = resetSoon && used >= 70 && stale;
-      return riskRow(provider, likelyCapped ? 100 : used, likelyCapped ? 'estimated' : 'observed', resetsAt);
+
+    // Per-window: take the most-recent snapshot for each window type, then pick
+    // the worst active one. This prevents a fresh primary (13%) snapshot from
+    // hiding a still-active secondary cap (97%).
+    const providerSnaps = recentSnapshots.filter(
+      r => (r.provider ?? 'codex') === provider && typeof r.used_percent === 'number'
+    );
+    const byWindow = new Map<string, RateLimitEvent>();
+    for (const s of providerSnaps) {
+      const wt = s.window_type ?? 'primary';
+      if (!byWindow.has(wt)) { byWindow.set(wt, s); } // first = most recent
+    }
+
+    if (byWindow.size > 0) {
+      const now = Date.now();
+      // Prefer the worst window whose reset hasn't happened yet
+      let worst: RateLimitEvent | undefined;
+      let worstPct = -1;
+      for (const [, snap] of byWindow.entries()) {
+        const pct    = snap.used_percent ?? 0;
+        const active = !snap.resets_at || new Date(snap.resets_at).getTime() > now;
+        if (active && pct > worstPct) { worstPct = pct; worst = snap; }
+      }
+      // Fall back: highest across all windows if all have reset
+      if (!worst) {
+        for (const [, snap] of byWindow.entries()) {
+          const pct = snap.used_percent ?? 0;
+          if (pct > worstPct) { worstPct = pct; worst = snap; }
+        }
+      }
+      if (worst) {
+        const used      = worst.used_percent!;
+        const resetsAt  = worst.resets_at;
+        const resetSoon = resetsAt && new Date(resetsAt).getTime() > now;
+        const staleMs   = now - new Date(worst.timestamp).getTime();
+        const stale     = staleMs > 20 * 60 * 1000;
+        const likelyCapped = resetSoon && used >= 70 && stale;
+        return riskRow(provider, likelyCapped ? 100 : used, likelyCapped ? 'estimated' : 'observed', resetsAt);
+      }
+    }
+
+    // Fall back to explicit rate-limit events
+    const latestLimit = providerLimits.find(r => typeof r.used_percent === 'number');
+    if (latestLimit?.used_percent !== undefined) {
+      return riskRow(provider, latestLimit.used_percent, 'observed', latestLimit.resets_at);
     }
 
     const capped = providerLimits[0];
@@ -463,16 +496,38 @@ export function queryProviderRisk(days = 30): ProviderRiskRow[] {
       return riskRow(provider, 95, 'estimated', capped.resets_at);
     }
 
-    const recentTokens = sessions
-      .filter(s => s.started_at >= cutoff)
+    // Compare current 5h window tokens against the historical max 5h window.
+    // Claude Code doesn't log used_percent, so this is the best we can do without
+    // knowing the actual cap. Scale to 80% of the ratio so we stay conservative.
+    const nowMs      = Date.now();
+    const current5h  = sessions
+      .filter(s => new Date(s.last_active_at ?? s.started_at).getTime() >= nowMs - 5 * 3600_000)
       .reduce((sum, s) => sum + s.input_tokens + s.output_tokens + s.cache_write + s.cache_read, 0);
-    if (recentTokens === 0) {
-      return riskRow(provider, 0, 'unknown');
-    }
-
-    const maxRecent = Math.max(recentTokens, ...sessions.map(s => s.input_tokens + s.output_tokens + s.cache_write + s.cache_read), 1);
-    return riskRow(provider, Math.min(70, Math.round((recentTokens / maxRecent) * 35)), 'estimated');
+    if (current5h === 0) { return riskRow(provider, 0, 'unknown'); }
+    const max5h = query5hWindowMax(provider);
+    const estimated = max5h > 0
+      ? Math.min(90, Math.round((current5h / max5h) * 80))
+      : Math.min(40, Math.round(current5h / 50_000)); // fallback: ~1% per 50k tokens, capped at 40%
+    return riskRow(provider, estimated, 'estimated');
   });
+}
+
+function query5hWindowMax(provider: string): number {
+  const windowMs = 5 * 3600_000;
+  const pts = store.sessions
+    .filter(s => (s.provider ?? inferProvider(s.model, s.session_file)) === provider)
+    .map(s => ({
+      t: new Date(s.last_active_at ?? s.started_at).getTime(),
+      toks: s.input_tokens + s.output_tokens + s.cache_write + s.cache_read,
+    }))
+    .sort((a, b) => a.t - b.t);
+  let max = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const t0  = pts[i].t;
+    const sum = pts.filter(p => p.t >= t0 && p.t < t0 + windowMs).reduce((s, p) => s + p.toks, 0);
+    if (sum > max) { max = sum; }
+  }
+  return max;
 }
 
 function riskRow(
@@ -660,6 +715,44 @@ export interface HourBucket {
   hour: number;      // 0, 6, 12, 18
   claude: { input: number; output: number; cost_usd: number; };
   codex:  { input: number; output: number; cost_usd: number; };
+}
+
+export function queryActivityByDay(days: number): HourBucket[] {
+  const cutoff = daysAgoIso(days);
+  const byBucket: Record<string, HourBucket> = {};
+
+  for (const s of store.sessions) {
+    const activeAt = s.last_active_at ?? s.started_at;
+    if (activeAt < cutoff) { continue; }
+    const d      = new Date(activeAt);
+    const date   = localDateOf(d);
+    const bucket = `${date} 00`;
+    if (!byBucket[bucket]) {
+      const bd = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+      byBucket[bucket] = { bucket, bucketUtc: bd.toISOString(), date, hour: 0,
+        claude: { input: 0, output: 0, cost_usd: 0 }, codex: { input: 0, output: 0, cost_usd: 0 } };
+    }
+    const provider = s.provider ?? inferProvider(s.model, s.session_file);
+    const bkt = provider === 'codex' ? byBucket[bucket].codex : byBucket[bucket].claude;
+    bkt.input    += s.input_tokens;
+    bkt.output   += s.output_tokens;
+    bkt.cost_usd += s.cost_usd;
+  }
+
+  const endMs  = Date.now();
+  const cursor = new Date(endMs - days * 24 * 3600_000);
+  cursor.setHours(0, 0, 0, 0);
+  while (cursor.getTime() <= endMs) {
+    const date   = localDateOf(cursor);
+    const bucket = `${date} 00`;
+    if (!byBucket[bucket]) {
+      byBucket[bucket] = { bucket, bucketUtc: cursor.toISOString(), date, hour: 0,
+        claude: { input: 0, output: 0, cost_usd: 0 }, codex: { input: 0, output: 0, cost_usd: 0 } };
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return Object.values(byBucket).sort((a, b) => a.bucket.localeCompare(b.bucket));
 }
 
 export function queryActivityBy6h(days: number): HourBucket[] {

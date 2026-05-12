@@ -7,6 +7,7 @@ import {
   ProjectRow,
   queryRateLimits,
   queryActivityBy6h,
+  queryActivityByDay,
   HourBucket,
   queryEngineBreakdown,
   EngineBreakdown,
@@ -34,6 +35,12 @@ function getChartRange(): number {
 }
 async function saveChartRange(days: number): Promise<void> {
   await _context?.globalState.update('chartRangeDays', days);
+}
+function getGranularity(): '6h' | '24h' {
+  return _context?.globalState.get<'6h' | '24h'>('chartGranularity', '6h') ?? '6h';
+}
+async function saveGranularity(gran: '6h' | '24h'): Promise<void> {
+  await _context?.globalState.update('chartGranularity', gran);
 }
 
 // ── Formatters ────────────────────────────────────────────────────────────────
@@ -241,6 +248,12 @@ function buildRangeToggle(activeDays: number): string {
   return [90, 30, 7, 3].map(days => {
     const active = days === activeDays ? ' active' : '';
     return `<button class="range-btn${active}" data-range="${days}">${days}d</button>`;
+  }).join('');
+}
+function buildGranToggle(activeGran: '6h' | '24h'): string {
+  return (['6h', '24h'] as const).map(g => {
+    const active = g === activeGran ? ' active' : '';
+    return `<button class="range-btn${active}" data-gran="${g}">${g}</button>`;
   }).join('');
 }
 
@@ -517,7 +530,8 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   const week       = querySummary(startOfWeek());
   const month      = querySummary(startOfMonth());
   const chartRange = getChartRange();
-  const hourly     = queryActivityBy6h(chartRange);
+  const gran       = getGranularity();
+  const hourly     = gran === '6h' ? queryActivityBy6h(chartRange) : queryActivityByDay(chartRange);
   const engines    = queryEngineBreakdown(chartRange);
   const rlRange    = queryRateLimits(chartRange);
   const risks      = queryProviderRisk(30);
@@ -772,9 +786,10 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   <!-- Claude Code activity chart -->
   <div class="chart-card" id="chart-claude">
     <div class="chart-head">
-      <span class="chart-title">Claude Code — activity (6h)</span>
+      <span class="chart-title">Claude Code — activity (${gran})</span>
       <div class="chart-legend">
         <span class="range-toggle">${buildRangeToggle(chartRange)}</span>
+        <span class="range-toggle">${buildGranToggle(gran)}</span>
         <span class="legend-item"><span class="legend-dot" style="background:#a78bfa"></span>Claude Code</span>
         ${hasCaps ? '<span class="legend-item"><span class="legend-dot" style="background:rgba(248,113,113,0.6);border-radius:2px"></span>Cap active</span>' : ''}
         ${hasRl ? '<span class="legend-item"><span class="legend-dot" style="background:#f87171"></span>Rate limit</span>' : ''}
@@ -787,7 +802,7 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   ${hasCodex ? `<!-- Codex activity chart -->
   <div class="chart-card" id="chart-codex">
     <div class="chart-head">
-      <span class="chart-title">Codex — activity (6h)</span>
+      <span class="chart-title">Codex — activity (${gran})</span>
       <div class="chart-legend">
         <span class="legend-item"><span class="legend-dot" style="background:#22d3ee"></span>Codex</span>
         ${hasCaps ? '<span class="legend-item"><span class="legend-dot" style="background:rgba(248,113,113,0.6);border-radius:2px"></span>Cap active</span>' : ''}
@@ -888,6 +903,12 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
     const rangeBtn = e.target.closest('[data-range]');
     if (rangeBtn) {
       vscode.postMessage({ type: 'setRange', days: Number(rangeBtn.dataset.range) });
+      return;
+    }
+
+    const granBtn = e.target.closest('[data-gran]');
+    if (granBtn) {
+      vscode.postMessage({ type: 'setGranularity', gran: granBtn.dataset.gran });
       return;
     }
 
@@ -1041,6 +1062,14 @@ export function showPanel(context: vscode.ExtensionContext): void {
         const days = [90, 30, 7, 3].includes(Number(msg.days)) ? Number(msg.days) : 30;
         await saveChartRange(days);
         if (panel) { panel.webview.html = buildHtml(_activeTab); }
+        break;
+      }
+
+      case 'setGranularity': {
+        if (msg.gran === '6h' || msg.gran === '24h') {
+          await saveGranularity(msg.gran as '6h' | '24h');
+          if (panel) { panel.webview.html = buildHtml(_activeTab); }
+        }
         break;
       }
     }
