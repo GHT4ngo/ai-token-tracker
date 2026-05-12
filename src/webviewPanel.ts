@@ -6,8 +6,10 @@ import {
   queryProjects,
   ProjectRow,
   queryRateLimits,
-  queryDailyByProvider,
-  DailyByProvider,
+  queryActivityBy6h,
+  HourBucket,
+  queryEngineBreakdown,
+  EngineBreakdown,
   queryProviderRisk,
   ProviderRiskRow,
   queryCapPeriods,
@@ -51,9 +53,22 @@ function fmtMB(bytes: number): string { return `${(bytes / 1024 / 1024).toFixed(
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
 
-function startOfToday(): string { return new Date().toISOString().slice(0, 10) + 'T00:00:00.000Z'; }
+function startOfToday(): string {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).toISOString();
+}
 function startOfWeek():  string { const d = new Date(); d.setDate(d.getDate() - 7);  return d.toISOString(); }
 function startOfMonth(): string { const d = new Date(); d.setDate(d.getDate() - 30); return d.toISOString(); }
+
+function rlLocalDate(timestamp: string): string {
+  const d = new Date(timestamp);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function getExtensionVersion(): string {
+  const ext = vscode.extensions.getExtension('tango-solutions.ai-token-tracker');
+  return (ext?.packageJSON as Record<string, unknown>)?.['version'] as string ?? '';
+}
 
 // ── Project grouping ──────────────────────────────────────────────────────────
 
@@ -125,9 +140,9 @@ function softcapLineSvg(x1: number, x2: number, y: number): string {
   return `<line x1="${x1.toFixed(1)}" y1="${y.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y.toFixed(1)}" stroke="#f87171" stroke-width="2" stroke-linecap="round" opacity="0.85"/>`;
 }
 
-// Single-provider smooth area chart with soft bezier curves
+// Single-provider smooth area chart with 6h buckets
 function buildProviderChart(
-  data: DailyByProvider[],
+  data: HourBucket[],
   provider: 'claude' | 'codex',
   color: string,
   gradId: string,
@@ -143,7 +158,7 @@ function buildProviderChart(
       ? d.claude.input + d.claude.output
       : d.codex.input  + d.codex.output
   );
-  const maxVal = Math.max(...totals, 1);
+  const maxVal  = Math.max(...totals, 1);
   const allZero = totals.every(v => v === 0);
 
   if (data.length === 0 || allZero) {
@@ -153,10 +168,12 @@ function buildProviderChart(
     </svg>`;
   }
 
-  const n    = data.length;
-  const xOf  = (i: number) => P.l + (n <= 1 ? iW / 2 : (i / (n - 1)) * iW);
-  const yOf  = (v: number) => P.t + iH - (v / maxVal) * iH;
-  const base = P.t + iH;
+  const n     = data.length;
+  const xOf   = (i: number) => P.l + (n <= 1 ? iW / 2 : (i / (n - 1)) * iW);
+  const yOf   = (v: number) => P.t + iH - (v / maxVal) * iH;
+  const base  = P.t + iH;
+  const colW  = n > 1 ? iW / (n - 1) : iW;
+  const halfC = colW / 2;
 
   const pts: [number, number][] = data.map((_, i) => [xOf(i), yOf(totals[i])]);
 
@@ -167,33 +184,38 @@ function buildProviderChart(
       <text x="${(P.l-5).toFixed(1)}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="9.5" fill="currentColor" fill-opacity="0.4">${k === 0 ? '0' : fmt(maxVal * k / 4)}</text>`;
   }).join('');
 
-  const step = Math.max(1, Math.floor(n / 7));
+  // X-axis: show label at start of each day (hour === 0), up to ~7 labels
+  const dayStartIdxs = data.reduce((acc, d, i) => { if (d.hour === 0) acc.push(i); return acc; }, [] as number[]);
+  const dayStep      = Math.max(1, Math.floor(dayStartIdxs.length / 7));
+  const labelIdxs    = new Set(dayStartIdxs.filter((_, j) => j % dayStep === 0));
+  if (n > 0) { labelIdxs.add(n - 1); }
   const xLabels = data.map((d, i) => {
-    if (i % step !== 0 && i !== n - 1) { return ''; }
-    return `<text x="${xOf(i).toFixed(1)}" y="${(H-4).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="currentColor" fill-opacity="0.4">${d.date.slice(5).replace('-', '/')}</text>`;
+    if (!labelIdxs.has(i)) { return ''; }
+    const label = (i === n - 1 && d.hour !== 0)
+      ? `${d.date.slice(5).replace('-', '/')} +${d.hour}h`
+      : d.date.slice(5).replace('-', '/');
+    return `<text x="${xOf(i).toFixed(1)}" y="${(H-4).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="currentColor" fill-opacity="0.4">${label}</text>`;
   }).join('');
 
-  // Cap bands: semi-transparent red columns for each day within a cap period
-  const colW   = n > 1 ? iW / (n - 1) : iW;
-  const halfCol = colW / 2;
+  // Cap bands: semi-transparent red columns per 6h bucket inside a cap period
   const providerPeriods = capPeriods.filter(cp => cp.provider === provider);
   const capBands = data.map((d, i) => {
-    const dayStart = d.date + 'T00:00:00.000Z';
-    const dayEnd   = d.date + 'T23:59:59.999Z';
-    const hasSecondary = providerPeriods.some(cp => cp.window_type === 'secondary' && cp.start <= dayEnd && cp.end >= dayStart);
-    const hasPrimary   = providerPeriods.some(cp => cp.window_type === 'primary'   && cp.start <= dayEnd && cp.end >= dayStart);
+    const bStart = d.bucketUtc;
+    const bEnd   = new Date(new Date(d.bucketUtc).getTime() + 6 * 3600_000 - 1).toISOString();
+    const hasSecondary = providerPeriods.some(cp => cp.window_type === 'secondary' && cp.start <= bEnd && cp.end >= bStart);
+    const hasPrimary   = providerPeriods.some(cp => cp.window_type === 'primary'   && cp.start <= bEnd && cp.end >= bStart);
     if (!hasPrimary && !hasSecondary) { return ''; }
-    const x    = xOf(i);
-    const rx   = Math.max(P.l, x - halfCol);
-    const rw   = Math.min(P.l + iW, x + halfCol) - rx;
-    // Secondary cap (weekly) gets a stronger red; primary (5h) is subtler
+    const x  = xOf(i);
+    const rx = Math.max(P.l, x - halfC);
+    const rw = Math.min(P.l + iW, x + halfC) - rx;
     const fill  = hasSecondary ? 'rgba(248,113,113,0.28)' : 'rgba(248,113,113,0.15)';
     const label = hasSecondary ? 'Weekly cap active' : '5h cap active';
-    return `<rect x="${rx.toFixed(1)}" y="${P.t.toFixed(1)}" width="${rw.toFixed(1)}" height="${iH.toFixed(1)}" fill="${fill}" rx="1"><title>${label} · ${d.date}</title></rect>`;
+    return `<rect x="${rx.toFixed(1)}" y="${P.t.toFixed(1)}" width="${rw.toFixed(1)}" height="${iH.toFixed(1)}" fill="${fill}" rx="1"><title>${label} · ${d.date} +${d.hour}h</title></rect>`;
   }).join('');
 
+  // Rate-limit markers: one per day, only at the day-start bucket
   const markers = data.map((d, i) => {
-    if (!rlDates.has(d.date)) { return ''; }
+    if (!rlDates.has(d.date) || d.hour !== 0) { return ''; }
     return rlMarkerSvg(xOf(i), P.t - 8, `Rate limit · ${d.date.slice(5).replace('-', '/')}`);
   }).join('');
 
@@ -235,38 +257,58 @@ function buildRiskCards(risks: ProviderRiskRow[]): string {
     return '<div class="empty">No AI engine activity found yet</div>';
   }
   return risks.map(r => {
-    const cls   = `risk-${r.status}`;
-    const label = r.provider === 'codex' ? 'Codex' : r.provider === 'claude' ? 'Claude Code' : r.provider;
+    const cls      = `risk-${r.status}`;
+    const label    = r.provider === 'codex' ? 'Codex' : r.provider === 'claude' ? 'Claude Code' : r.provider;
+    const isCapped = r.status === 'capped';
+
+    let percentHtml = '';
+    let noteHtml    = '';
+
+    if (isCapped) {
+      percentHtml = `<div class="risk-capped-badge">CAPPED</div>`;
+      if (r.resets_at && new Date(r.resets_at).getTime() > Date.now()) {
+        const msLeft = new Date(r.resets_at).getTime() - Date.now();
+        const hLeft  = msLeft / 3_600_000;
+        const left   = hLeft < 1 ? `~${Math.round(hLeft * 60)}m` : hLeft < 24 ? `~${hLeft.toFixed(1)}h` : `~${(hLeft / 24).toFixed(1)}d`;
+        noteHtml = `<div class="risk-note">Lifts in ${left} · ${new Date(r.resets_at).toLocaleString()}</div>`;
+      } else {
+        noteHtml = `<div class="risk-note">${esc(riskCopy(r))}</div>`;
+      }
+    } else {
+      percentHtml = `<div class="risk-percent">~${r.used_percent}% used</div>`;
+      noteHtml    = `<div class="risk-note">${esc(riskCopy(r))}</div>`;
+    }
+
     return `<div class="risk-card ${cls}">
       <div class="risk-top"><span>${esc(label)}</span><span class="risk-confidence">${r.confidence}</span></div>
-      <div class="risk-percent">~${r.used_percent}% used</div>
+      ${percentHtml}
       <div class="risk-bar"><span style="width:${Math.max(2, r.used_percent)}%"></span></div>
-      <div class="risk-note">${esc(riskCopy(r))}</div>
+      ${noteHtml}
     </div>`;
   }).join('');
 }
 
-// ── Usage tracker bar (bottom of panel) ──────────────────────────────────────
+// ── Engine cost breakdown (bottom of panel) ───────────────────────────────────
 
-function buildUsageTracker(risks: ProviderRiskRow[]): string {
-  if (risks.length === 0) { return ''; }
-  const bars = risks.map(r => {
-    const label   = r.provider === 'codex' ? 'Codex' : r.provider === 'claude' ? 'Claude Code' : r.provider;
-    const color   = r.provider === 'codex' ? '#22d3ee' : '#a78bfa';
-    const dotColor = r.used_percent >= 80 ? '#f87171' : r.used_percent >= 50 ? '#fbbf24' : '#34d399';
-    const pct     = Math.min(100, Math.max(2, r.used_percent));
-    return `<div class="ut-row">
-      <span class="ut-label">${esc(label)}</span>
-      <div class="ut-bar-wrap">
-        <div class="ut-bar-fill" style="width:${pct}%;background:${color};"></div>
-      </div>
-      <span class="ut-pct" style="color:${dotColor}">${r.used_percent}%</span>
-      <span class="ut-conf dim">${r.confidence}</span>
+function buildEngineBreakdown(engines: EngineBreakdown[], chartRange: number): string {
+  if (engines.length === 0) { return ''; }
+  const rows = engines.map(e => {
+    const color  = e.provider === 'codex' ? '#22d3ee' : '#a78bfa';
+    const pct    = Math.min(100, Math.max(0.5, e.cost_pct));
+    const multStr = `×${e.multiplier.toFixed(2)}`;
+    return `<div class="eb-row">
+      <span class="eb-model">${esc(e.model)}</span>
+      <span class="eb-mult dim">${multStr}</span>
+      <div class="eb-bar-wrap"><div class="eb-bar-fill" style="width:${pct}%;background:${color};"></div></div>
+      <span class="eb-pct">${e.cost_pct.toFixed(1)}%</span>
+      <span class="eb-tok dim">~${fmt(e.raw_tokens)}</span>
+      <span class="eb-cost">${fmtCost(e.cost_usd)}</span>
     </div>`;
   }).join('');
-  return `<div class="usage-tracker">
-    <div class="ut-title">Estimated quota usage</div>
-    ${bars}
+  return `<div class="engine-breakdown">
+    <div class="eb-title">Engine usage — last ${chartRange} days</div>
+    <div class="eb-legend dim">× = cost-per-token vs Sonnet (1.00×) · % = share of total cost</div>
+    ${rows}
   </div>`;
 }
 
@@ -475,19 +517,21 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   const week       = querySummary(startOfWeek());
   const month      = querySummary(startOfMonth());
   const chartRange = getChartRange();
-  const daily      = queryDailyByProvider(chartRange);
+  const hourly     = queryActivityBy6h(chartRange);
+  const engines    = queryEngineBreakdown(chartRange);
   const rlRange    = queryRateLimits(chartRange);
   const risks      = queryProviderRisk(30);
-  const rlDates    = new Set(rlRange.map(r => r.timestamp.slice(0, 10)));
+  const rlDates    = new Set(rlRange.map(r => rlLocalDate(r.timestamp)));
   const rl30       = queryRateLimits(30);
   const rl7        = rl30.filter(r => new Date(r.timestamp) >= new Date(Date.now() - 7 * 864e5));
+  const version    = getExtensionVersion();
 
   const cfg        = vscode.workspace.getConfiguration('tokenTracker');
   const merges     = cfg.get<Record<string, string[]>>('projectMerges', {});
   const folders    = getFolders();
   const allProjects = groupProjects(queryProjects(), merges);
 
-  const hasCodex  = daily.some(d => d.codex.input + d.codex.output > 0);
+  const hasCodex  = hourly.some(d => d.codex.input + d.codex.output > 0);
   const hasRl     = rlDates.size > 0;
   const capPeriods      = queryCapPeriods(chartRange);
   const capPredictions  = queryCapPredictions();
@@ -508,8 +552,8 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   const statsActive  = activeTab === 'stats'  ? ' active' : '';
   const memActive    = activeTab === 'memory' ? ' active' : '';
 
-  const claudeChartHtml = buildProviderChart(daily, 'claude', '#a78bfa', 'gClaude', rlDates, capPeriods);
-  const codexChartHtml  = hasCodex ? buildProviderChart(daily, 'codex', '#22d3ee', 'gCodex', rlDates, capPeriods) : '';
+  const claudeChartHtml = buildProviderChart(hourly, 'claude', '#a78bfa', 'gClaude', rlDates, capPeriods);
+  const codexChartHtml  = hasCodex ? buildProviderChart(hourly, 'codex', '#22d3ee', 'gCodex', rlDates, capPeriods) : '';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -543,6 +587,7 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   .header { display:flex; align-items:center; gap:10px; margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid var(--vscode-panel-border); }
   .hex { font-size:22px; }
   .header h2 { font-size:1.05em; font-weight:700; flex:1; }
+  .version-badge { font-size:0.72em; font-weight:normal; }
 
   /* Tabs */
   .tabs { display:flex; gap:2px; margin-bottom:18px; border-bottom:1px solid rgba(128,128,128,0.15); }
@@ -570,6 +615,7 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   .risk-low .risk-bar span, .risk-capped .risk-bar span { background:var(--red); }
   .risk-watch .risk-bar span { background:var(--yellow); }
   .risk-note { font-size:0.78em; opacity:0.62; }
+  .risk-capped-badge { font-size:1.1em; font-weight:800; color:var(--red); letter-spacing:.06em; margin-bottom:9px; }
 
   /* Controls */
   .range-toggle { display:flex; gap:4px; align-items:center; }
@@ -627,16 +673,19 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   .new-folder-btn { background:rgba(128,128,128,0.08); border:1px solid rgba(128,128,128,0.16); color:inherit; border-radius:6px; padding:3px 10px; font-size:0.73em; cursor:pointer; white-space:nowrap; }
   .new-folder-btn:hover { background:rgba(128,128,128,0.16); }
 
-  /* Usage tracker */
-  .usage-tracker { background:rgba(128,128,128,0.07); border:1px solid rgba(128,128,128,0.14); border-radius:10px; padding:13px 16px; margin-bottom:14px; }
-  .ut-title { font-size:0.72em; text-transform:uppercase; letter-spacing:.09em; font-weight:600; opacity:0.45; margin-bottom:10px; }
-  .ut-row { display:flex; align-items:center; gap:10px; margin-bottom:7px; }
-  .ut-row:last-child { margin-bottom:0; }
-  .ut-label { font-size:0.78em; font-weight:600; min-width:100px; }
-  .ut-bar-wrap { flex:1; height:6px; background:rgba(128,128,128,0.15); border-radius:999px; overflow:hidden; }
-  .ut-bar-fill { height:100%; border-radius:999px; opacity:0.8; transition:width 0.3s; }
-  .ut-pct { font-size:0.76em; font-weight:700; min-width:36px; text-align:right; }
-  .ut-conf { font-size:0.68em; min-width:60px; }
+  /* Engine breakdown */
+  .engine-breakdown { background:rgba(128,128,128,0.07); border:1px solid rgba(128,128,128,0.14); border-radius:10px; padding:13px 16px; margin-bottom:14px; }
+  .eb-title { font-size:0.72em; text-transform:uppercase; letter-spacing:.09em; font-weight:600; opacity:0.45; margin-bottom:3px; }
+  .eb-legend { font-size:0.67em; margin-bottom:10px; }
+  .eb-row { display:flex; align-items:center; gap:8px; margin-bottom:7px; flex-wrap:nowrap; }
+  .eb-row:last-child { margin-bottom:0; }
+  .eb-model { font-size:0.76em; font-weight:600; min-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .eb-mult { font-size:0.70em; min-width:34px; }
+  .eb-bar-wrap { flex:1; height:6px; background:rgba(128,128,128,0.15); border-radius:999px; overflow:hidden; }
+  .eb-bar-fill { height:100%; border-radius:999px; opacity:0.8; }
+  .eb-pct { font-size:0.76em; font-weight:700; min-width:40px; text-align:right; }
+  .eb-tok { font-size:0.68em; min-width:46px; text-align:right; }
+  .eb-cost { font-size:0.72em; color:var(--yellow); font-weight:600; min-width:44px; text-align:right; }
 
   /* Memory section */
   .mem-section { margin-top:4px; }
@@ -678,6 +727,7 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
 <div class="header">
   <span class="hex">⬡</span>
   <h2>AI Token Tracker</h2>
+  ${version ? `<span class="version-badge dim">v${esc(version)}</span>` : ''}
 </div>
 
 <div class="tabs">
@@ -722,7 +772,7 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   <!-- Claude Code activity chart -->
   <div class="chart-card" id="chart-claude">
     <div class="chart-head">
-      <span class="chart-title">Claude Code — tokens/day</span>
+      <span class="chart-title">Claude Code — activity (6h)</span>
       <div class="chart-legend">
         <span class="range-toggle">${buildRangeToggle(chartRange)}</span>
         <span class="legend-item"><span class="legend-dot" style="background:#a78bfa"></span>Claude Code</span>
@@ -737,7 +787,7 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
   ${hasCodex ? `<!-- Codex activity chart -->
   <div class="chart-card" id="chart-codex">
     <div class="chart-head">
-      <span class="chart-title">Codex — tokens/day</span>
+      <span class="chart-title">Codex — activity (6h)</span>
       <div class="chart-legend">
         <span class="legend-item"><span class="legend-dot" style="background:#22d3ee"></span>Codex</span>
         ${hasCaps ? '<span class="legend-item"><span class="legend-dot" style="background:rgba(248,113,113,0.6);border-radius:2px"></span>Cap active</span>' : ''}
@@ -764,7 +814,7 @@ function buildHtml(activeTab: 'stats' | 'memory' = 'stats'): string {
     </table>
   </div>
 
-  ${buildUsageTracker(risks)}
+  ${buildEngineBreakdown(engines, chartRange)}
 
   <div class="footer">
     Costs are retail API equivalents — informational only.<br>

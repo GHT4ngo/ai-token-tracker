@@ -212,7 +212,29 @@ function daysAgoIso(days: number): string {
 }
 
 function todayStartIso(): string {
-  return new Date().toISOString().slice(0, 10) + 'T00:00:00.000Z';
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).toISOString();
+}
+
+function localDateOf(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function local6hBucketOf(isoTimestamp: string): { bucket: string; bucketUtc: string; date: string; hour: number } {
+  const d = new Date(isoTimestamp);
+  const h = Math.floor(d.getHours() / 6) * 6;
+  const date = localDateOf(d);
+  const bucketDate = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0, 0, 0);
+  return { bucket: `${date} ${String(h).padStart(2, '0')}`, bucketUtc: bucketDate.toISOString(), date, hour: h };
+}
+
+function tokenMultiplier(model: string): number {
+  const m = (model || '').toLowerCase();
+  if (m.includes('opus'))                                     { return 5.0; }
+  if (m.includes('haiku'))                                    { return 0.27; }
+  if (m.includes('gpt-5.2') || m.includes('gpt-5.3'))        { return 0.58; }
+  if (m.includes('gpt') || m.includes('codex'))              { return 0.42; }
+  return 1.0; // sonnet baseline
 }
 
 // ── API query helpers ─────────────────────────────────────────────────────
@@ -627,4 +649,90 @@ export function queryCapPredictions(): CapPrediction[] {
       ? a.provider.localeCompare(b.provider)
       : a.window_type === 'primary' ? -1 : 1
   );
+}
+
+// ── 6h activity buckets (for charts) ─────────────────────────────────────
+
+export interface HourBucket {
+  bucket: string;    // "2026-05-12 18" (local time label)
+  bucketUtc: string; // UTC ISO of bucket start (for cap band comparison)
+  date: string;      // "2026-05-12" local date
+  hour: number;      // 0, 6, 12, 18
+  claude: { input: number; output: number; cost_usd: number; };
+  codex:  { input: number; output: number; cost_usd: number; };
+}
+
+export function queryActivityBy6h(days: number): HourBucket[] {
+  const cutoff = daysAgoIso(days);
+  const byBucket: Record<string, HourBucket> = {};
+
+  for (const s of store.sessions) {
+    const activeAt = s.last_active_at ?? s.started_at;
+    if (activeAt < cutoff) { continue; }
+    const b = local6hBucketOf(activeAt);
+    if (!byBucket[b.bucket]) {
+      byBucket[b.bucket] = { ...b, claude: { input: 0, output: 0, cost_usd: 0 }, codex: { input: 0, output: 0, cost_usd: 0 } };
+    }
+    const provider = s.provider ?? inferProvider(s.model, s.session_file);
+    const bkt = provider === 'codex' ? byBucket[b.bucket].codex : byBucket[b.bucket].claude;
+    bkt.input    += s.input_tokens;
+    bkt.output   += s.output_tokens;
+    bkt.cost_usd += s.cost_usd;
+  }
+
+  // Fill empty 6h buckets for the full range
+  const endMs  = Date.now();
+  const cursor = new Date(endMs - days * 24 * 3600_000);
+  cursor.setMinutes(0, 0, 0);
+  cursor.setHours(Math.floor(cursor.getHours() / 6) * 6);
+  while (cursor.getTime() <= endMs) {
+    const b = local6hBucketOf(cursor.toISOString());
+    if (!byBucket[b.bucket]) {
+      byBucket[b.bucket] = { ...b, claude: { input: 0, output: 0, cost_usd: 0 }, codex: { input: 0, output: 0, cost_usd: 0 } };
+    }
+    cursor.setTime(cursor.getTime() + 6 * 3600_000);
+  }
+
+  return Object.values(byBucket).sort((a, b) => a.bucket.localeCompare(b.bucket));
+}
+
+// ── Per-engine cost breakdown ─────────────────────────────────────────────
+
+export interface EngineBreakdown {
+  model: string;
+  provider: string;
+  raw_tokens: number;
+  cost_usd: number;
+  cost_pct: number;
+  multiplier: number;
+}
+
+export function queryEngineBreakdown(days: number): EngineBreakdown[] {
+  const cutoff = daysAgoIso(days);
+  const byModel: Record<string, { provider: string; raw_tokens: number; cost_usd: number }> = {};
+
+  for (const s of store.sessions) {
+    const activeAt = s.last_active_at ?? s.started_at;
+    if (activeAt < cutoff) { continue; }
+    const model = s.model || 'unknown';
+    if (!byModel[model]) {
+      byModel[model] = { provider: s.provider ?? inferProvider(s.model, s.session_file), raw_tokens: 0, cost_usd: 0 };
+    }
+    byModel[model].raw_tokens += s.input_tokens + s.output_tokens;
+    byModel[model].cost_usd  += s.cost_usd;
+  }
+
+  const totalCost = Object.values(byModel).reduce((sum, e) => sum + e.cost_usd, 0);
+
+  return Object.entries(byModel)
+    .filter(([, data]) => data.raw_tokens > 0)
+    .map(([model, data]) => ({
+      model,
+      provider:    data.provider,
+      raw_tokens:  data.raw_tokens,
+      cost_usd:    data.cost_usd,
+      cost_pct:    totalCost > 0 ? (data.cost_usd / totalCost) * 100 : 0,
+      multiplier:  tokenMultiplier(model),
+    }))
+    .sort((a, b) => b.cost_pct - a.cost_pct);
 }
